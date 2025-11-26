@@ -12,11 +12,11 @@ jobs:
       - name: Install Dependencies (Desktop + noVNC + RustDesk)
         run: |
           sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl
+          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl unzip
       - name: Install RustDesk Server (hbbs & hbbr)
         run: |
           # Download and install hbbs (ID/Rendezvous Server)
-          wget https://github.com/rustdesk/rustdesk-server/releases/download/v1.1.10/rustdesk-server-linux-x64.zip
+          wget https://github.com/rustdesk/rustdesk-server/releases/download/v1.1.14/rustdesk-server-linux-x64.zip
           unzip rustdesk-server-linux-x64.zip
           sudo mv rustdesk-server-linux-x64/hbbs /usr/local/bin/hbbs
           sudo mv rustdesk-server-linux-x64/hbbr /usr/local/bin/hbbr
