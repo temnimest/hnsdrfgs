@@ -1,96 +1,141 @@
 # .github/workflows/desktop.yml
-name: Web Desktop (noVNC + Cloudflare Tunnel)
-
+name: Web Desktop (noVNC + Cloudflare Tunnel + RustDesk)
 on:
-  workflow_dispatch:  # 手動実行専用
-
+  workflow_dispatch: # 手動実行専用
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 240  # 4時間まで生きる
-
+    timeout-minutes: 240 # 4時間まで生きる
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install Dependencies (Desktop + noVNC)
+      - name: Install Dependencies (Desktop + noVNC + RustDesk)
         run: |
           sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx
-
+          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl
+      - name: Install RustDesk Server (hbbs & hbbr)
+        run: |
+          # Download and install hbbs (ID/Rendezvous Server)
+          wget https://github.com/rustdesk/rustdesk-server/releases/download/v1.1.10/rustdesk-server-linux-x64.zip
+          unzip rustdesk-server-linux-x64.zip
+          sudo mv rustdesk-server-linux-x64/hbbs /usr/local/bin/hbbs
+          sudo mv rustdesk-server-linux-x64/hbbr /usr/local/bin/hbbr
+          rm -rf rustdesk-server-linux-x64 rustdesk-server-linux-x64.zip
+          
+          # Create data directories
+          sudo mkdir -p /var/lib/rustdesk
+          sudo mkdir -p /var/log/rustdesk
       - name: Install cloudflared (Ubuntu 24.04対応)
         run: |
           # 依存インストール
           sudo apt update
           sudo apt install -y apt-transport-https ca-certificates gnupg lsb-release
-          
+         
           # Cloudflare GPGキー追加
           curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          
+         
           # リポジトリ追加 (Ubuntu 24.04 = noble)
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg arch=$(dpkg --print-architecture)] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          
+         
           # 更新してインストール
           sudo apt update
           sudo apt install -y cloudflared
-
       # VNC パスワード設定（固定値、必要に応じて secrets に変更）
       - name: Set VNC Password
         run: |
           mkdir -p ~/.vnc
           echo "github123" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
-
       # VNC サーバー起動（高フレームレート・低遅延設定）
       - name: Start VNC Server (Optimized)
         run: |
           vncserver :1 -geometry 1600x900 -depth 24 -fps 60 -compresslevel 1 -quality 7 &
           sleep 5
-
+      # RustDesk Server 起動（ポート 21115-21117 を公開）
+      - name: Start RustDesk Server
+        run: |
+          # hbbs (ID Server) をバックグラウンドで起動
+          nohup sudo hbbs -r /var/lib/rustdesk -k _ -p 21115 > /var/log/rustdesk/hbbs.log 2>&1 &
+          sleep 3
+          
+          # hbbr (Relay Server) をバックグラウンドで起動
+          nohup sudo hbbr -k _ -p 21117 > /var/log/rustdesk/hbbr.log 2>&1 &
+          sleep 3
+          
+          # ID と Key を取得（hbbs ログから）
+          ID=$(sudo tail -f /var/log/rustdesk/hbbs.log 2>/dev/null | grep "ID:" | head -n1 | awk '{print $2}')
+          KEY=$(sudo tail -f /var/log/rustdesk/hbbs.log 2>/dev/null | grep "Key:" | head -n1 | awk '{print $2}')
+          
+          if [ -z "$ID" ] || [ -z "$KEY" ]; then
+            echo "Failed to retrieve RustDesk ID/Key. Check logs."
+            sudo tail -n 20 /var/log/rustdesk/hbbs.log
+            exit 1
+          fi
+          
+          echo "RustDesk ID: $ID"
+          echo "RustDesk Key: $KEY"
+          echo "rustdesk_id=$ID" >> $GITHUB_OUTPUT
+          echo "rustdesk_key=$KEY" >> $GITHUB_OUTPUT
       # noVNC 起動（低遅延: WebP無効、Turbo JPEG有効）
       - name: Start noVNC (Low Latency)
         run: |
           # 自署名証明書生成（HTTPS必須）
           openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ~/self.key -out ~/self.crt -subj "/CN=localhost"
-          
+         
           # websockify 起動（タイムアウト無効化）
           websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
             --cert=~/self.crt --key=~/self.key \
             --idle-timeout=0 --timeout=0 --compression=0 &
           sleep 5
-
-      # Cloudflare Tunnel 起動（Quick Tunnel で即時公開）
+      # Cloudflare Tunnel 起動（Quick Tunnel で即時公開、RustDesk ポートも含む）
       - name: Start Cloudflare Tunnel (Quick & Low Latency)
         id: tunnel
         run: |
-          # バックグラウンドでトンネル起動
-          nohup cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+          # 複数のローカルポートをプロキシ（noVNC:6080, RustDesk:21115,21116,21117）
+          # config.yml で複数サービスを定義
+          cat > ~/cloudflared-config.yml << EOF
+          tunnel: temp-tunnel
+          credentials-file: /tmp/tunnel.json
           
-          # URL 取得（安定するまで待機）
+          ingress:
+            - hostname: novnc.${{ github.run_id }}.trycloudflare.com
+              service: http://localhost:6080
+            - hostname: rustdesk.${{ github.run_id }}.trycloudflare.com
+              service: tcp://localhost:21115
+            - service: http_status:404
+          EOF
+          
+          # Quick Tunnel でトンネル作成（config使用）
+          nohup cloudflared tunnel --config ~/cloudflared-config.yml --no-autoupdate > tunnel.log 2>&1 &
+         
+          # URL 取得（安定するまで待機、noVNC URL をメインに）
           echo "Waiting for tunnel URL..."
           COUNTER=0
           while [ $COUNTER -lt 60 ]; do
             sleep 2
-            URL=$(grep -o 'https://.*\.trycloudflare\.com' tunnel.log | head -n1)
-            if [ ! -z "$URL" ]; then
+            NOVNC_URL=$(grep -o 'https://.*\.trycloudflare\.com' tunnel.log | grep -v "rustdesk" | head -n1)
+            if [ ! -z "$NOVNC_URL" ]; then
               echo "=== DESKTOP READY ==="
-              echo "Open this URL in your browser: $URL"
+              echo "noVNC URL: $NOVNC_URL"
               echo "VNC Password: github123"
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
+              echo "RustDesk ID: ${{ steps.tunnel.outputs.rustdesk_id || env.rustdesk_id }}"
+              echo "RustDesk Key: ${{ steps.tunnel.outputs.rustdesk_key || env.rustdesk_key }}"
+              echo "RustDesk URL (for client): rustdesk://${{ steps.tunnel.outputs.rustdesk_id }}@${{ github.run_id }}.trycloudflare.com:21115?key=${{ steps.tunnel.outputs.rustdesk_key }}"
+              echo "tunnel_url=$NOVNC_URL" >> $GITHUB_OUTPUT
               break
             fi
             COUNTER=$((COUNTER+1))
           done
-          
-          if [ -z "$URL" ]; then
+         
+          if [ -z "$NOVNC_URL" ]; then
             echo "Tunnel URL not found. Check logs."
             cat tunnel.log
             exit 1
           fi
-
       # セッション保持（4時間）
       - name: Keep Desktop Alive
         run: |
           echo "Desktop is running at: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "RustDesk ready with ID: ${{ steps.tunnel.outputs.rustdesk_id }}, Key: ${{ steps.tunnel.outputs.rustdesk_key }}"
           echo "It will stay alive for 4 hours. Use Ctrl+C in browser to disconnect."
-          sleep 14400  # 4時間 = 14400秒
+          sleep 14400 # 4時間 = 14400秒
