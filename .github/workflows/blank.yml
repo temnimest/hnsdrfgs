@@ -11,9 +11,6 @@ jobs:
   setup:
     runs-on: ubuntu-latest  # Ubuntu 24.04 (2025年11月時点)
 
-    # services: 削除 - Docker ENTRYPOINT 未定義エラー回避のため、バイナリ直接実行に変更
-    # (オプション: 本番で Docker 使用時は docker/run.sh を指定)
-
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4  # 最新版
@@ -21,15 +18,15 @@ jobs:
     - name: Update system and install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat  # socat でポートフォワード
+        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat  # socat で TCP ポートフォワード
         # RustDesk サーバー OSS バイナリを最新版 (v1.1.14) ダウンロード
-        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4 | sed 's/v//')
+        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4)
         echo "Latest server version: $LATEST_SERVER"
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/v${LATEST_SERVER}/hbbs-linux-amd64.zip || true  # エラー回避
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/v${LATEST_SERVER}/hbbr-linux-amd64.zip || true
-        unzip -o hbbs-linux-amd64.zip -d hbbs/ || true
-        unzip -o hbbr-linux-amd64.zip -d hbbr/ || true
-        sudo cp hbbs/hbbs /usr/local/bin/ || true
+        wget "https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/hbbs_${LATEST_SERVER}_x86_64.zip" || true  # ZIP ファイル名修正
+        wget "https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/hbbr_${LATEST_SERVER}_x86_64.zip" || true
+        unzip -o "hbbs_${LATEST_SERVER}_x86_64.zip" -d hbbs/ || true
+        unzip -o "hbbr_${LATEST_SERVER}_x86_64.zip" -d hbbr/ || true
+        sudo cp hbbs/hbbs /usr/local/bin/ || true  # 抽出後ファイル名
         sudo cp hbbr/hbbr /usr/local/bin/ || true
         sudo chmod +x /usr/local/bin/hb* || true
         echo "Server binaries installed."
@@ -42,38 +39,46 @@ jobs:
         sudo mkdir -p /opt/rustdesk
         sudo cp id_ed* /opt/rustdesk/
         RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
-        echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV  # 環境変数に保存（後続ステップで使用）
+        echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV  # 環境変数に保存
         echo "Generated Key: $RUSTDESK_KEY"
 
     - name: Start RustDesk Server (hbbs & hbbr バイナリ実行)
       run: |
-        # ポートフォワード (Actions ネットワーク対応)
-        sudo socat TCP-LISTEN:21115,fork TCP:127.0.0.1:21115 &  # hbbs TCP
-        sudo socat TCP-LISTEN:21116,fork TCP:127.0.0.1:21116 &  # hbbs TCP
-        sudo socat UDP-LISTEN:21116,fork UDP:127.0.0.1:21116 &  # hbbs UDP
-        sudo socat TCP-LISTEN:21117,fork TCP:127.0.0.1:21117 &  # hbbr
-        sudo socat TCP-LISTEN:21118,fork TCP:127.0.0.1:21118 &  # hbbs WebSocket
-        sudo socat TCP-LISTEN:21119,fork TCP:127.0.0.1:21119 &  # hbbr WebSocket
+        # TCP ポートフォワードのみ (Actions UDP 制限回避、hbbs 内部で UDP ハンドル)
+        sudo socat TCP-LISTEN:21115,fork TCP:127.0.0.1:21115 &
+        sudo socat TCP-LISTEN:21116,fork TCP:127.0.0.1:21116 &
+        sudo socat TCP-LISTEN:21117,fork TCP:127.0.0.1:21117 &
+        sudo socat TCP-LISTEN:21118,fork TCP:127.0.0.1:21118 &
+        sudo socat TCP-LISTEN:21119,fork TCP:127.0.0.1:21119 &
         sleep 3
         # hbbs (ID サーバー) 起動
         nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21117 > hbbs.log 2>&1 &
+        HBBS_PID=$!
         sleep 5
         # hbbr (Relay サーバー) 起動
         nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
-        sleep 5
+        HBBR_PID=$!
         # ログ確認
         tail -n 10 hbbs.log
         tail -n 10 hbbr.log
-        echo "RustDesk Server running on ports 21115-21119 (via socat)."
+        echo "RustDesk Server running on ports 21115-21119 (TCP via socat). PIDs: hbbs=$HBBS_PID, hbbr=$HBBR_PID"
 
     - name: Install RustDesk Client (v1.4.4)
       run: |
-        # 最新 deb ダウンロード
-        wget https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk-1.4.4-x86_64.deb || true
-        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
-        # 自ホストサーバー設定
-        rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service || true
-        rustdesk --get-id  # ID 出力テスト
+        # 最新 deb ダウンロード (ファイル名修正: amd64)
+        wget "https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk_1.4.4_amd64.deb" || true
+        if [ -f "rustdesk_1.4.4_amd64.deb" ]; then
+          sudo dpkg -i rustdesk_1.4.4_amd64.deb || sudo apt-get install -f -y
+        else
+          echo "Deb download failed; skipping client install (use AppImage fallback if needed)."
+        fi
+        # 自ホストサーバー設定 (rustdesk コマンド存在時のみ)
+        if command -v rustdesk &> /dev/null; then
+          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service || true
+          rustdesk --get-id || true
+        else
+          echo "RustDesk client not installed; manual setup required."
+        fi
 
     - name: Setup Desktop Environment (XFCE + VNC)
       run: |
@@ -84,7 +89,7 @@ jobs:
         sleep 3
         # VNC サーバー (ポート 5900, パスワード: password - Secrets 推奨)
         mkdir -p ~/.vnc
-        echo "password" | x11vnc -storepasswd - -usepw > /dev/null  # 簡易パスワード設定
+        echo "password" | x11vnc -storepasswd - -usepw > /dev/null
         nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
         sleep 5
         # デスクトップ初期化
@@ -92,14 +97,19 @@ jobs:
         xsetroot -solid lightblue
         startxfce4 &  # XFCE 起動
         sleep 5
-        echo "Desktop ready. VNC: localhost:5900 (password: password). RustDesk ID: $(rustdesk --get-id || echo 'N/A')"
+        echo "Desktop ready. VNC: localhost:5900 (password: password)."
+        if command -v rustdesk &> /dev/null; then
+          echo "RustDesk ID: $(rustdesk --get-id || echo 'N/A')"
+        fi
 
     - name: Test Connection and Output Info
       run: |
         # ステータス確認
         netstat -tuln | grep 211 || true
         netstat -tuln | grep 5900 || true
-        rustdesk --get-id || true
+        if command -v rustdesk &> /dev/null; then
+          rustdesk --get-id || true
+        fi
         echo "RustDesk Server Key (for clients): $RUSTDESK_KEY"
         echo "Access via Web Client:"
         echo "- Build/Host: https://github.com/rustdesk/rustdesk/tree/master/web"
