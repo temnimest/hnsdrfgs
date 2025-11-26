@@ -21,8 +21,8 @@ jobs:
       # 3. Connect to Cloudflare WARP to anonymize all traffic from the runner
       - name: Connect to Cloudflare WARP
         run: |
-          # Register the client in consumer mode (updated syntax for 2025+ versions)
-          sudo warp-cli registration new
+          # Register the client in consumer mode with TOS accepted (correct flag placement for 2025+ CLI)
+          sudo warp-cli --accept-tos registration new
           # Connect to the WARP service
           sudo warp-cli connect
           # Verify connection using Cloudflare's official trace endpoint
@@ -31,13 +31,13 @@ jobs:
           TRACE_OUTPUT=$(curl -s https://www.cloudflare.com/cdn-cgi/trace/)
           if echo "$TRACE_OUTPUT" | grep -q "warp=on"; then
             echo "Successfully connected to Cloudflare WARP (warp=on confirmed)."
+            NEW_IP=$(curl -s ifconfig.me)
+            echo "New public IP address: ${NEW_IP}"
           else
-            echo "WARN: WARP connection may not be fully active. Trace output:"
+            echo "ERROR: WARP connection failed. Trace output:"
             echo "$TRACE_OUTPUT"
+            exit 1
           fi
-          # Also display the new IP for reference
-          NEW_IP=$(curl -s ifconfig.me)
-          echo "New public IP address: ${NEW_IP}"
       # 4. Install a lightweight desktop environment, VNC server, and noVNC
       - name: Install Desktop and VNC
         run: |
