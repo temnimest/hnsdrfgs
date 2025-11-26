@@ -16,11 +16,11 @@ jobs:
       - name: Install RustDesk Server (hbbs & hbbr)
         run: |
           # Download and install hbbs (ID/Rendezvous Server)
-          wget https://github.com/rustdesk/rustdesk-server/releases/download/v1.1.14/rustdesk-server-linux-x64.zip
-          unzip rustdesk-server-linux-x64.zip
-          sudo mv rustdesk-server-linux-x64/hbbs /usr/local/bin/hbbs
-          sudo mv rustdesk-server-linux-x64/hbbr /usr/local/bin/hbbr
-          rm -rf rustdesk-server-linux-x64 rustdesk-server-linux-x64.zip
+          wget https://github.com/rustdesk/rustdesk-server/releases/latest/download/rustdesk-server-linux-amd64.zip
+          unzip rustdesk-server-linux-amd64.zip
+          sudo mv rustdesk-server-linux-amd64/hbbs /usr/local/bin/hbbs
+          sudo mv rustdesk-server-linux-amd64/hbbr /usr/local/bin/hbbr
+          rm -rf rustdesk-server-linux-amd64 rustdesk-server-linux-amd64.zip
           
           # Create data directories
           sudo mkdir -p /var/lib/rustdesk
@@ -53,6 +53,7 @@ jobs:
           sleep 5
       # RustDesk Server 起動（ポート 21115-21117 を公開）
       - name: Start RustDesk Server
+        id: rustdesk
         run: |
           # hbbs (ID Server) をバックグラウンドで起動
           nohup sudo hbbs -r /var/lib/rustdesk -k _ -p 21115 > /var/log/rustdesk/hbbs.log 2>&1 &
@@ -62,13 +63,23 @@ jobs:
           nohup sudo hbbr -k _ -p 21117 > /var/log/rustdesk/hbbr.log 2>&1 &
           sleep 3
           
-          # ID と Key を取得（hbbs ログから）
-          ID=$(sudo tail -f /var/log/rustdesk/hbbs.log 2>/dev/null | grep "ID:" | head -n1 | awk '{print $2}')
-          KEY=$(sudo tail -f /var/log/rustdesk/hbbs.log 2>/dev/null | grep "Key:" | head -n1 | awk '{print $2}')
+          # ID と Key を取得（hbbs ログから、待機して複数回チェック）
+          COUNTER=0
+          ID=""
+          KEY=""
+          while [ $COUNTER -lt 30 ]; do
+            ID=$(sudo tail -n 50 /var/log/rustdesk/hbbs.log | grep "ID:" | tail -n1 | awk '{print $2}')
+            KEY=$(sudo tail -n 50 /var/log/rustdesk/hbbs.log | grep "Key:" | tail -n1 | awk '{print $2}')
+            if [ ! -z "$ID" ] && [ ! -z "$KEY" ]; then
+              break
+            fi
+            sleep 1
+            COUNTER=$((COUNTER+1))
+          done
           
           if [ -z "$ID" ] || [ -z "$KEY" ]; then
             echo "Failed to retrieve RustDesk ID/Key. Check logs."
-            sudo tail -n 20 /var/log/rustdesk/hbbs.log
+            sudo tail -n 50 /var/log/rustdesk/hbbs.log
             exit 1
           fi
           
@@ -118,9 +129,9 @@ jobs:
               echo "=== DESKTOP READY ==="
               echo "noVNC URL: $NOVNC_URL"
               echo "VNC Password: github123"
-              echo "RustDesk ID: ${{ steps.tunnel.outputs.rustdesk_id || env.rustdesk_id }}"
-              echo "RustDesk Key: ${{ steps.tunnel.outputs.rustdesk_key || env.rustdesk_key }}"
-              echo "RustDesk URL (for client): rustdesk://${{ steps.tunnel.outputs.rustdesk_id }}@${{ github.run_id }}.trycloudflare.com:21115?key=${{ steps.tunnel.outputs.rustdesk_key }}"
+              echo "RustDesk ID: ${{ steps.rustdesk.outputs.rustdesk_id }}"
+              echo "RustDesk Key: ${{ steps.rustdesk.outputs.rustdesk_key }}"
+              echo "RustDesk URL (for client): rustdesk://${{ steps.rustdesk.outputs.rustdesk_id }}@${{ github.run_id }}.trycloudflare.com:21115?key=${{ steps.rustdesk.outputs.rustdesk_key }}"
               echo "tunnel_url=$NOVNC_URL" >> $GITHUB_OUTPUT
               break
             fi
@@ -136,6 +147,6 @@ jobs:
       - name: Keep Desktop Alive
         run: |
           echo "Desktop is running at: ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo "RustDesk ready with ID: ${{ steps.tunnel.outputs.rustdesk_id }}, Key: ${{ steps.tunnel.outputs.rustdesk_key }}"
+          echo "RustDesk ready with ID: ${{ steps.rustdesk.outputs.rustdesk_id }}, Key: ${{ steps.rustdesk.outputs.rustdesk_key }}"
           echo "It will stay alive for 4 hours. Use Ctrl+C in browser to disconnect."
           sleep 14400 # 4時間 = 14400秒
