@@ -16,16 +16,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Install Cloudflare WARP for anonymity
+      # 2. Install Cloudflare WARP using the official script for a more reliable setup
       - name: Install Cloudflare WARP
         run: |
-          # Add the Cloudflare GPG key and repository
-          curl -fsSL https://pkg.cloudflare.com/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
+          # Download and execute the official Cloudflare WARP installation script.
+          # This method automatically adds the repository and installs the package.
+          curl -fsSL https://install.cloudflare-warp.com/deb/ | sudo bash
 
-      # 3. Connect to Cloudflare WARP to anonymize traffic
+      # 3. Connect to Cloudflare WARP to anonymize all traffic from the runner
       - name: Connect to Cloudflare WARP
         run: |
           # Register and connect to the WARP service
@@ -40,7 +38,7 @@ jobs:
       # 4. Install a lightweight desktop environment, VNC server, and noVNC
       - name: Install Desktop and VNC
         run: |
-          sudo apt-get update
+          # Note: 'apt-get update' is not needed here as the WARP install script already ran it.
           sudo apt-get install -y --no-install-recommends lxde-core tightvncserver websockify novnc xfonts-base xfonts-75dpi xfonts-100dpi
 
       # 5. Set the VNC password directly in the script
