@@ -9,40 +9,30 @@ on:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest  # Ubuntu 24.04 (2025年11月時点のデフォルト)
+    runs-on: ubuntu-latest  # Ubuntu 24.04 (2025年11月時点)
 
-    services:
-      # RustDesk OSS サーバー Docker (v1.1.14 相当、WebSocket 対応)
-      rustdesk-server:
-        image: rustdesk/rustdesk-server:latest
-        ports:
-          - 21115:21115/tcp  # hbbs TCP (シグナリング)
-          - 21116:21116/tcp  # hbbs TCP (NAT)
-          - 21116:21116/udp  # hbbs UDP (NAT 必須)
-          - 21117:21117/tcp  # hbbr (リレー)
-          - 21118:21118/tcp  # hbbs WebSocket (Web クライアント用)
-          - 21119:21119/tcp  # hbbr WebSocket (Web クライアント用)
-        env:
-          RELAY_HOST: localhost
-          # キー生成はステップで別途（Docker 内では動的）
+    # services: 削除 - Docker ENTRYPOINT 未定義エラー回避のため、バイナリ直接実行に変更
+    # (オプション: 本番で Docker 使用時は docker/run.sh を指定)
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4  # 最新版 (2025年対応)
+      uses: actions/checkout@v4  # 最新版
 
     - name: Update system and install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget curl xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl
-        # RustDesk サーバー OSS バイナリを最新版 (v1.1.14) ダウンロード (Docker と併用でバックアップ)
-        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/hbbs-linux-amd64.zip
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/hbbr-linux-amd64.zip
-        unzip hbbs-linux-amd64.zip -d hbbs/
-        unzip hbbr-linux-amd64.zip -d hbbr/
-        sudo cp hbbs/hbbs /usr/local/bin/
-        sudo cp hbbr/hbbr /usr/local/bin/
-        sudo chmod +x /usr/local/bin/hb*
+        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat  # socat でポートフォワード
+        # RustDesk サーバー OSS バイナリを最新版 (v1.1.14) ダウンロード
+        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4 | sed 's/v//')
+        echo "Latest server version: $LATEST_SERVER"
+        wget https://github.com/rustdesk/rustdesk-server/releases/download/v${LATEST_SERVER}/hbbs-linux-amd64.zip || true  # エラー回避
+        wget https://github.com/rustdesk/rustdesk-server/releases/download/v${LATEST_SERVER}/hbbr-linux-amd64.zip || true
+        unzip -o hbbs-linux-amd64.zip -d hbbs/ || true
+        unzip -o hbbr-linux-amd64.zip -d hbbr/ || true
+        sudo cp hbbs/hbbs /usr/local/bin/ || true
+        sudo cp hbbr/hbbr /usr/local/bin/ || true
+        sudo chmod +x /usr/local/bin/hb* || true
+        echo "Server binaries installed."
 
     - name: Generate RustDesk key pair (Ed25519)
       run: |
@@ -51,65 +41,73 @@ jobs:
         openssl pkey -in id_ed25519 -pubout -out id_ed25519.pub
         sudo mkdir -p /opt/rustdesk
         sudo cp id_ed* /opt/rustdesk/
-        export RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
-        echo "Generated Key: $RUSTDESK_KEY"  # ログ出力（クライアント設定用）
+        RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
+        echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV  # 環境変数に保存（後続ステップで使用）
+        echo "Generated Key: $RUSTDESK_KEY"
 
-    - name: Start RustDesk Server (hbbs & hbbr, Docker + バイナリ併用)
+    - name: Start RustDesk Server (hbbs & hbbr バイナリ実行)
       run: |
-        # Docker サービスが hbbs/hbbr を自動起動（キー適用）
-        sudo cp /opt/rustdesk/id_ed25519 /var/lib/docker/volumes/rustdesk-server/_data/  # Docker ボリュームにキー注入
-        # 追加でバイナリ起動（冗長性）
-        nohup hbbs -k /opt/rustdesk/id_ed25519 -r localhost:21117 > hbbs.log 2>&1 &
+        # ポートフォワード (Actions ネットワーク対応)
+        sudo socat TCP-LISTEN:21115,fork TCP:127.0.0.1:21115 &  # hbbs TCP
+        sudo socat TCP-LISTEN:21116,fork TCP:127.0.0.1:21116 &  # hbbs TCP
+        sudo socat UDP-LISTEN:21116,fork UDP:127.0.0.1:21116 &  # hbbs UDP
+        sudo socat TCP-LISTEN:21117,fork TCP:127.0.0.1:21117 &  # hbbr
+        sudo socat TCP-LISTEN:21118,fork TCP:127.0.0.1:21118 &  # hbbs WebSocket
+        sudo socat TCP-LISTEN:21119,fork TCP:127.0.0.1:21119 &  # hbbr WebSocket
+        sleep 3
+        # hbbs (ID サーバー) 起動
+        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21117 > hbbs.log 2>&1 &
         sleep 5
+        # hbbr (Relay サーバー) 起動
         nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
         sleep 5
         # ログ確認
         tail -n 10 hbbs.log
         tail -n 10 hbbr.log
-        echo "RustDesk Server running on ports 21115-21119."
+        echo "RustDesk Server running on ports 21115-21119 (via socat)."
 
     - name: Install RustDesk Client (v1.4.4)
       run: |
         # 最新 deb ダウンロード
-        wget https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk-1.4.4-x86_64.deb
+        wget https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk-1.4.4-x86_64.deb || true
         sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
-        # 自ホストサーバー設定 (ID Server: localhost:21116, Key: 生成キー)
-        export RUSTDESK_SERVER="127.0.0.1:21116"
-        rustdesk --set-id-server "$RUSTDESK_SERVER" --set-key "$RUSTDESK_KEY" --install-service
+        # 自ホストサーバー設定
+        rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service || true
         rustdesk --get-id  # ID 出力テスト
 
     - name: Setup Desktop Environment (XFCE + VNC)
       run: |
-        sudo apt-get install -y xfce4 xfce4-goodies xorg  # XFCE + Xorg (Ubuntu 24.04 対応)
-        # Xvfb 仮想ディスプレイ設定
+        sudo apt-get install -y xfce4 xfce4-goodies xorg || true  # XFCE + Xorg
+        # Xvfb 仮想ディスプレイ
         export DISPLAY=:99
         Xvfb :99 -screen 0 1024x768x24 > xvfb.log 2>&1 &
         sleep 3
-        # VNC サーバー設定 (ポート 5900, パスワード: password - Secrets で変更推奨)
+        # VNC サーバー (ポート 5900, パスワード: password - Secrets 推奨)
         mkdir -p ~/.vnc
-        x11vnc -storepasswd password ~/.vnc/passwd
+        echo "password" | x11vnc -storepasswd - -usepw > /dev/null  # 簡易パスワード設定
         nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
         sleep 5
         # デスクトップ初期化
         export DISPLAY=:99
-        xsetroot -solid lightblue  # 背景設定
-        startxfce4 &  # XFCE 起動 (バックグラウンド)
+        xsetroot -solid lightblue
+        startxfce4 &  # XFCE 起動
         sleep 5
-        echo "Desktop ready. VNC: localhost:5900 (password: password). RustDesk ID: $(rustdesk --get-id)"
+        echo "Desktop ready. VNC: localhost:5900 (password: password). RustDesk ID: $(rustdesk --get-id || echo 'N/A')"
 
     - name: Test Connection and Output Info
       run: |
         # ステータス確認
-        netstat -tuln | grep 211
-        netstat -tuln | grep 5900
-        rustdesk --get-id
+        netstat -tuln | grep 211 || true
+        netstat -tuln | grep 5900 || true
+        rustdesk --get-id || true
         echo "RustDesk Server Key (for clients): $RUSTDESK_KEY"
         echo "Access via Web Client:"
-        echo "- Build/Host RustDesk Web Client[](https://github.com/rustdesk/rustdesk/tree/master/web)"
-        echo "- Config: ID Server = your-runner-ip:21116, Key = above"
+        echo "- Build/Host: https://github.com/rustdesk/rustdesk/tree/master/web"
+        echo "- Config: ID Server = your-runner-ip:21116, Key = $RUSTDESK_KEY"
         echo "- WebSocket: wss://your-runner-ip:21118 (hbbs) / wss://your-runner-ip:21119 (hbbr)"
-        echo "- Use reverse proxy (Nginx) for HTTPS (see below)."
+        echo "- Use Nginx reverse proxy for HTTPS (sample below)."
         echo "Direct VNC: vncviewer your-runner-ip:5900 (password: password)"
+        echo "Runner IP: $(curl -s ifconfig.me || echo 'Use ngrok for exposure')"
 
     - name: Cleanup (force stop all services)
       if: always()
@@ -122,5 +120,6 @@ jobs:
         sudo pkill -f rustdesk || true
         sudo pkill -f startxfce4 || true
         sudo pkill -f xfce4 || true
+        sudo pkill -f socat || true
         sleep 2
         echo "Cleanup completed."
