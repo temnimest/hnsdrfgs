@@ -1,0 +1,108 @@
+# .github/workflows/desktop.yml
+
+name: 'Anonymous Web-based Desktop Environment'
+
+# Allows this workflow to be manually triggered from the Actions tab
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Runs on the latest version of Ubuntu
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checks out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Install Cloudflare WARP for anonymity
+      - name: Install Cloudflare WARP
+        run: |
+          # Add the Cloudflare GPG key and repository
+          curl -fsSL https://pkg.cloudflare.com/pubkey.gpg | sudo gpg --dearmor -o /usr/share/keyrings/cloudflare-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-archive-keyring.gpg] https://pkg.cloudflare.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare.list
+          sudo apt-get update
+          sudo apt-get install -y cloudflare-warp
+
+      # 3. Connect to Cloudflare WARP to anonymize traffic
+      - name: Connect to Cloudflare WARP
+        run: |
+          # Register and connect to the WARP service
+          sudo warp-cli register
+          sudo warp-cli connect
+          # Verify connection and display the new IP address
+          echo "Verifying WARP connection..."
+          NEW_IP=$(curl -s ifconfig.me)
+          echo "Successfully connected to Cloudflare WARP."
+          echo "New public IP address: ${NEW_IP}"
+
+      # 4. Install a lightweight desktop environment, VNC server, and noVNC
+      - name: Install Desktop and VNC
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends lxde-core tightvncserver websockify novnc xfonts-base xfonts-75dpi xfonts-100dpi
+
+      # 5. Set the VNC password directly in the script
+      - name: Set VNC Password
+        run: |
+          mkdir -p ~/.vnc
+          # WARNING: Hardcoding passwords is a security risk.
+          # This is done as per the request for a self-contained setup.
+          # It is highly recommended to change 'your_strong_password'.
+          echo "your_strong_password" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+
+      # 6. Start the VNC server
+      - name: Start VNC Server
+        run: |
+          # Start VNC server on display :1 with a 1280x720 resolution
+          vncserver :1 -geometry 1280x720 -depth 24
+
+      # 7. Start the websockify proxy to allow browser access
+      - name: Start Websockify for noVNC access
+        run: |
+          # websockify proxies connections from the web (port 6080) to the VNC server (port 5901)
+          # --web=/usr/share/novnc also serves the noVNC web client
+          websockify --web=/usr/share/novnc 6080 localhost:5901 > websockify.log 2>&1 &
+
+      # 8. Install Node.js (required for localtunnel)
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      # 9. Install localtunnel to expose the service to the public internet
+      - name: Install LocalTunnel
+        run: npm install -g localtunnel
+
+      # 10. Start localtunnel to expose the noVNC port
+      - name: Start LocalTunnel for public access
+        run: |
+          # Run localtunnel in the background and save the URL to a file
+          lt --port 6080 > tunnel_url.txt &
+          # Wait for localtunnel to establish the connection
+          sleep 15
+
+      # 11. Display the connection information in the workflow logs
+      - name: Display Connection Information
+        run: |
+          # Read the URL issued by localtunnel
+          TUNNEL_URL=$(cat tunnel_url.txt | head -n 1)
+          echo "--------------------------------------------------"
+          echo "🎉 Your anonymous desktop environment is ready!"
+          echo "--------------------------------------------------"
+          echo "📲 Access the desktop via your browser at the URL below:"
+          echo "URL: ${TUNNEL_URL}/vnc.html?autoconnect=true&resize=scale"
+          echo "--------------------------------------------------"
+          echo "🔑 VNC Password: your_strong_password"
+          echo "--------------------------------------------------"
+          echo "⚠️  This session will automatically terminate in 6 hours."
+          echo "⚠️  The connection might take a few seconds to establish."
+          echo "--------------------------------------------------"
+
+      # 12. Keep the workflow running by sleeping for the maximum duration
+      - name: Keep workflow alive
+        run: |
+          # Sleep for the maximum GitHub Actions runtime (6 hours = 21600 seconds)
+          sleep 21600
