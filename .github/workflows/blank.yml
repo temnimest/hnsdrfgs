@@ -1,198 +1,77 @@
-name: Web Desktop (noVNC + Cloudflare Tunnel + RustDesk)
+name: Setup Desktop with RustDesk
+
 on:
-  workflow_dispatch:  # 手動実行専用
+  workflow_dispatch:  # 手動トリガーで実行
 
 jobs:
-  desktop:
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 240  # 最大4時間
+    permissions:
+      contents: read
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      # 1. 基本パッケージインストール
-      - name: Install Dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl unzip openssl net-tools  # net-tools for netstat
+    - name: Update system and install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y software-properties-common curl wget gnupg
 
-      # 2. RustDesk Server（最新構造に完全対応）
-      - name: Install RustDesk Server (hbbs & hbbr)
-        run: |
-          wget https://github.com/rustdesk/rustdesk-server/releases/latest/download/rustdesk-server-linux-amd64.zip
-          unzip rustdesk-server-linux-amd64.zip
+    - name: Install XFCE desktop environment
+      run: |
+        # XFCE と軽量 VNC サーバーをインストール（デスクトップ GUI 構築）
+        sudo apt-add-repository universe
+        sudo apt-get update
+        sudo apt-get install -y xfce4 xfce4-goodies xorg-dbgsym dbus-x11 x11vnc xvfb
 
-          # 新構造（amd64/）にも旧構造にも対応（findで確実に拾う）
-          sudo find . -type f -name "hbbs" -exec mv {} /usr/local/bin/hbbs \;
-          sudo find . -type f -name "hbbr" -exec mv {} /usr/local/bin/hbbr \;
+    - name: Install RustDesk
+      run: |
+        # 最新 deb パッケージをダウンロード（2025/11/27 時点: v1.2.6 相当、必要に応じてリリースページ確認）
+        wget https://github.com/rustdesk/rustdesk/releases/download/1.2.6/rustdesk-1.2.6-x86_64.deb
+        sudo apt-get install -fy ./rustdesk-1.2.6-x86_64.deb
+        rm rustdesk-1.2.6-x86_64.deb
 
-          # バイナリ確認（デバッグ用）
-          which hbbs || (echo "hbbs not found!" && exit 1)
-          which hbbr || (echo "hbbr not found!" && exit 1)
+    - name: Configure RustDesk as service
+      run: |
+        # RustDesk を systemd サービスとしてインストール（ヘッドレス起動）
+        sudo rustdesk --install-service
+        # 固定パスワードを設定（Secrets から取得推奨、セキュリティのためランダム生成例）
+        echo "${{ secrets.RUSTDESK_PASSWORD || 'RandomPass123!' }}" | sudo rustdesk --password-store
 
-          # クリーンアップ
-          rm -rf amd64 rustdesk-server-linux-amd64 rustdesk-server-linux-amd64.zip
+    - name: Start desktop session and RustDesk
+      run: |
+        # 仮想ディスプレイで XFCE を起動
+        export DISPLAY=:99
+        Xvfb :99 -screen 0 1920x1080x24 &
+        sleep 5
+        dbus-launch --exit-with-session startxfce4 &
+        sleep 10  # デスクトップ起動待機
+        # RustDesk サービス起動
+        sudo systemctl start rustdeskd
+        sleep 5
 
-          # 必要ディレクトリ作成（権限設定）
-          sudo mkdir -p /var/lib/rustdesk /var/log/rustdesk
-          sudo chmod 755 /var/lib/rustdesk /var/log/rustdesk
-          sudo chown -R $USER:$USER /var/log/rustdesk  # ログ書き込み権限
+    - name: Get RustDesk ID and Password
+      run: |
+        # ID とパスワードを取得してログ出力（Web クライアントで使用）
+        ID=$(sudo rustdesk --get-id)
+        PASS=$(sudo rustdesk --get-password)
+        echo "RustDesk ID: $ID"
+        echo "RustDesk Password: $PASS"
+        echo "Use these credentials in RustDesk Web Client: https://rustdesk.com/web"
+        # 出力例: ID はランダム生成、PASS は設定値
 
-      # 3. cloudflared インストール（Ubuntu 24.04対応）
-      - name: Install cloudflared
-        run: |
-          sudo apt update
-          sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt update
-          sudo apt install -y cloudflared
-
-      # 4. VNC パスワード設定（固定。必要なら secrets に変更可能）
-      - name: Set VNC Password
-        run: |
-          mkdir -p ~/.vnc
-          echo "github123" | vncpasswd -f > ~/.vnc/passwd
-          chmod 600 ~/.vnc/passwd
-
-      # 5. VNC サーバー起動（高画質・低遅延設定）
-      - name: Start VNC Server
-        run: |
-          vncserver :1 -geometry 1600x900 -depth 24 -fps 60 -compresslevel 0 -quality 9 &
-          sleep 8
-
-      # 6. RustDesk Server 起動（フラグ修正 + プロセス/ポート確認）
-      - name: Start RustDesk Server
-        id: rustdesk
-        run: |
-          # ログディレクトリ確認
-          ls -la /var/log/rustdesk || echo "Log dir exists"
-
-          # hbbs 起動（-k _ 削除: デフォルトでキー生成）
-          echo "Starting hbbs..."
-          nohup sudo hbbs -r /var/lib/rustdesk > /var/log/rustdesk/hbbs.log 2>&1 &
-          HBBS_PID=$!
-          sleep 10  # キー生成待機
-
-          # hbbs プロセス確認
-          if ! sudo ps -p $HBBS_PID > /dev/null; then
-            echo "hbbs failed to start! Log:"
-            sudo cat /var/log/rustdesk/hbbs.log || echo "No log yet"
-            exit 1
-          fi
-
-          # ポートリスニング確認（hbbsの21115/21116）
-          if ! netstat -tuln | grep -q ":21115\|:21116"; then
-            echo "hbbs ports not listening!"
-            netstat -tuln | grep 211
-            exit 1
-          fi
-
-          # hbbr 起動
-          echo "Starting hbbr..."
-          nohup sudo hbbr > /var/log/rustdesk/hbbr.log 2>&1 &
-          HBBR_PID=$!
-          sleep 5
-
-          if ! sudo ps -p $HBBR_PID > /dev/null; then
-            echo "hbbr failed to start! Log:"
-            sudo cat /var/log/rustdesk/hbbr.log
-            exit 1
-          fi
-
-          # キー抽出（IDはクライアント接続時に生成）
-          sleep 5  # 追加待機
-          KEY=$(sudo tail -n 50 /var/log/rustdesk/hbbs.log | grep "Key:" | tail -1 | awk '{print $2}' || echo "")
-          if [ -z "$KEY" ]; then
-            echo "Failed to get RustDesk Key. Full log:"
-            sudo cat /var/log/rustdesk/hbbs.log
-            exit 1
-          fi
-
-          echo "RustDesk Server started successfully!"
-          echo "Generated Key: $KEY"
-          echo "Note: ID will be generated when a RustDesk client connects to the server."
-          echo "rustdesk_key=$KEY" >> $GITHUB_OUTPUT
-
-          # ログスニペット表示
-          echo "hbbs log snippet:"
-          sudo tail -n 15 /var/log/rustdesk/hbbs.log
-
-      # 7. noVNC 起動（低遅延設定 + HTTPS対応）
-      - name: Start noVNC
-        run: |
-          openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-            -keyout ~/self.key -out ~/self.crt -subj "/CN=localhost"
-
-          websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
-            --cert=~/self.crt --key=~/self.key \
-            --idle-timeout=0 --timeout=0 &
-          sleep 5
-
-      # 8. Cloudflare Tunnel 起動（noVNC + RustDesk 全ポート対応）
-      - name: Start Cloudflare Tunnel
-        id: tunnel
-        run: |
-          cat > ~/cf-config.yml << EOF
-          tunnel: rustdesk-temp-${{ github.run_id }}
-          credentials-file: /tmp/cred.json
-
-          ingress:
-            - hostname: novnc-${{ github.run_id }}.trycloudflare.com
-              service: https://localhost:6080
-              originRequest:
-                noTLSVerify: true
-            - hostname: rustdesk-${{ github.run_id }}.trycloudflare.com
-              service: tcp://localhost:21115
-            - hostname: relay-${{ github.run_id }}.trycloudflare.com
-              service: tcp://localhost:21117
-            - service: http_status:404
-          EOF
-
-          nohup cloudflared tunnel run --config ~/cf-config.yml > tunnel.log 2>&1 &
-
-          echo "Waiting for tunnel to be ready..."
-          for i in {1..60}; do
-            sleep 3
-            URL=$(grep -o 'https://novnc-.*\.trycloudflare\.com' tunnel.log | head -1)
-            [ -n "$URL" ] && break
-          done
-
-          if [ -z "$URL" ]; then
-            echo "Tunnel URL not found!"
-            cat tunnel.log
-            exit 1
-          fi
-
-          echo "=== DESKTOP READY ==="
-          echo "noVNC URL → $URL"
-          echo "VNC Password → github123"
-          echo "RustDesk Key → ${{ steps.rustdesk.outputs.rustdesk_key }}"
-          echo "RustDesk Server URL → rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
-          echo "RustDesk Connect → Connect via RustDesk client to generate ID"
-
-          echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-
-      # 9. 最終出力 & 4時間キープ
-      - name: Final Info & Keep Alive
-        run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "    noVNC（ブラウザで即接続）"
-          echo "    ${{ steps.tunnel.outputs.tunnel_url }}"
-          echo ""
-          echo "    VNC パスワード: github123"
-          echo ""
-          echo "    RustDesk Server Key: ${{ steps.rustdesk.outputs.rustdesk_key }}"
-          echo "    RustDesk サーバーURL: rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
-          echo ""
-          echo "    📝 注意: RustDesk IDはクライアント接続時に自動生成されます。"
-          echo "      1. RustDeskクライアントを起動"
-          echo "      2. ID入力欄で「+」をクリック → サーバー追加"
-          echo "      3. サーバー: rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
-          echo "      4. キー: ${{ steps.rustdesk.outputs.rustdesk_key }}"
-          echo "      5. 接続 → IDが自動生成・表示されます"
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "このセッションは最大4時間有効です（タイムアウトまで待機中）"
-          sleep 14400  # 4時間
+    - name: Optional: Setup self-hosted server (hbbs/hbbr)
+      if: false  # デフォルトオフ、必要なら true に
+      run: |
+        # 自ホストサーバー（オプション: Web コンソール統合）
+        sudo apt-get install -y docker.io docker-compose
+        sudo systemctl start docker
+        # hbbs/hbbr Docker 起動（ポート 21115-21117 開放、Actions では制限あり）
+        docker run --name hbbs -p 21115:21115 -p 21116:21116 -dt rustdesk/rustdesk-server hbbs -r 21117:21117
+        docker run --name hbbr -p 21117:21117 -dt rustdesk/rustdesk-server hbbr
+        # キー生成（/root/.config/rustdesk/id_ed25519.pub を使用）
+        sleep 10
+        PUB_KEY=$(docker exec hbbs cat /root/.config/rustdesk/id_ed25519.pub | base64)
+        echo "Self-hosted Public Key: $PUB_KEY"
+        # クライアント再設定: sudo rustdesk --server hbbs.yourdomain.com:21116 --key $PUB_KEY
