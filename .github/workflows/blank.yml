@@ -1,101 +1,64 @@
-name: 'Anonymous Web-based Desktop Environment'
-# Allows this workflow to be manually triggered from the Actions tab
+# .github/workflows/desktop.yml
+name: Web Desktop (noVNC + Cloudflare Tunnel)
+
 on:
-  workflow_dispatch:
+  workflow_dispatch:  # 手動実行専用
+
 jobs:
-  build:
-    # Runs on the latest version of Ubuntu
+  desktop:
     runs-on: ubuntu-latest
+    timeout-minutes: 999  # 4時間まで生きる
+
     steps:
-      # 1. Checks out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
-      # 2. Install Cloudflare WARP (consumer client) using the official repository for reliable setup
-      - name: Install Cloudflare WARP
+
+      - name: Install Desktop + noVNC + cloudflared
         run: |
-          # Add Cloudflare's official package repository for the consumer WARP client
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          # Update package list and install the consumer WARP client
-          sudo apt-get update && sudo apt-get install -y cloudflare-warp
-      # 3. Connect to Cloudflare WARP to anonymize all traffic from the runner
-      - name: Connect to Cloudflare WARP
-        run: |
-          # Register the client in consumer mode with TOS accepted (correct flag placement for 2025+ CLI)
-          sudo warp-cli --accept-tos registration new
-          # Connect to the WARP service
-          sudo warp-cli connect
-          # Verify connection using Cloudflare's official trace endpoint
-          echo "Verifying WARP connection..."
-          sleep 10  # Allow time for full connection stabilization
-          TRACE_OUTPUT=$(curl -s https://www.cloudflare.com/cdn-cgi/trace/)
-          if echo "$TRACE_OUTPUT" | grep -q "warp=on"; then
-            echo "Successfully connected to Cloudflare WARP (warp=on confirmed)."
-            NEW_IP=$(curl -s ifconfig.me)
-            echo "New public IP address: ${NEW_IP}"
-          else
-            echo "ERROR: WARP connection failed. Trace output:"
-            echo "$TRACE_OUTPUT"
-            exit 1
-          fi
-      # 4. Install a lightweight desktop environment, VNC server, and noVNC
-      - name: Install Desktop and VNC
-        run: |
-          # Note: 'apt-get update' is not needed here as the WARP install already ran it.
-          sudo apt-get install -y --no-install-recommends lxde-core tightvncserver websockify novnc xfonts-base xfonts-75dpi xfonts-100dpi
-      # 5. Set the VNC password directly in the script
+          sudo apt update
+          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx cloudflared
+
+      # パスワードは固定でもいいし、secretsにしてもOK（ここでは簡単のため固定）
       - name: Set VNC Password
         run: |
           mkdir -p ~/.vnc
-          # WARNING: Hardcoding passwords is a security risk.
-          # This is done as per the request for a self-contained setup.
-          # It is highly recommended to change 'your_strong_password'.
-          echo "your_strong_password" | vncpasswd -f > ~/.vnc/passwd
+          echo "github123" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
-      # 6. Start the VNC server
-      - name: Start VNC Server
+
+      - name: Start VNC Server (高フレームレート設定)
         run: |
-          # Start VNC server on display :1 with a 1280x720 resolution
-          vncserver :1 -geometry 1280x720 -depth 24
-      # 7. Start the websockify proxy to allow browser access
-      - name: Start Websockify for noVNC access
+          vncserver :1 -geometry 1600x900 -depth 24 -fps 60 &
+          sleep 5
+
+      # noVNC を最適化（WebP無効化で遅延削減、turbo JPEG）
+      - name: Start noVNC (低遅延設定)
         run: |
-          # websockify proxies connections from the web (port 6080) to the VNC server (port 5901)
-          # --web=/usr/share/novnc also serves the noVNC web client
-          websockify --web=/usr/share/novnc 6080 localhost:5901 > websockify.log 2>&1 &
-      # 8. Install Node.js (required for localtunnel)
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
-      # 9. Install localtunnel to expose the service to the public internet
-      - name: Install LocalTunnel
-        run: npm install -g localtunnel
-      # 10. Start localtunnel to expose the noVNC port
-      - name: Start LocalTunnel for public access
+          websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
+            --cert=~/self.pem --key=~/self.pem &
+          sleep 3
+
+      # Cloudflare Tunnel 起動（最速の方法）
+      - name: Cloudflare Tunnel (Quick Tunnel)
         run: |
-          # Run localtunnel in the background and save the URL to a file
-          lt --port 6080 > tunnel_url.txt &
-          # Wait for localtunnel to establish the connection
-          sleep 15
-      # 11. Display the connection information in the workflow logs
-      - name: Display Connection Information
+          # Quick Tunnel（無料・即時公開）
+          cloudflared tunnel --url http://localhost:6080 --loglevel info &
+          
+          # 30秒待ってURLを取得（安定するまで待つ）
+          echo "Waiting for tunnel URL..."
+          for i in {1..30}; do
+            URL=$(cloudflared tunnel route list --output json | jq -r '.[0].connections[0].origin_ip + ":443" | xargs -I {} echo "https://$(cloudflared tunnel --url http://localhost:6080 2>&1 | grep -o 'https://[^ ]*\.trycloudflare\.com')")
+            if [[ $URL == https://*.trycloudflare.com ]]; then
+              echo "=== YOUR DESKTOP IS READY ==="
+              echo "URL: $URL"
+              echo "URL=$URL" >> $GITHUB_OUTPUT
+              break
+            fi
+            sleep 5
+          done
+
+      # もっと安定させたい場合は、事前にトンネル登録 + トークンを使う（後述）
+
+      - name: Keep alive (4時間)
         run: |
-          # Read the URL issued by localtunnel
-          TUNNEL_URL=$(cat tunnel_url.txt | head -n 1)
-          echo "--------------------------------------------------"
-          echo "🎉 Your anonymous desktop environment is ready!"
-          echo "--------------------------------------------------"
-          echo "📲 Access the desktop via your browser at the URL below:"
-          echo "URL: ${TUNNEL_URL}/vnc.html?autoconnect=true&resize=scale"
-          echo "--------------------------------------------------"
-          echo "🔑 VNC Password: your_strong_password"
-          echo "--------------------------------------------------"
-          echo "⚠️ This session will automatically terminate in 6 hours."
-          echo "⚠️ The connection might take a few seconds to establish."
-          echo "--------------------------------------------------"
-      # 12. Keep the workflow running by sleeping for the maximum duration
-      - name: Keep workflow alive
-        run: |
-          # Sleep for the maximum GitHub Actions runtime (6 hours = 21600 seconds)
-          sleep 21600
+          echo "Desktop will stay alive for 4 hours..."
+          sleep 999m
