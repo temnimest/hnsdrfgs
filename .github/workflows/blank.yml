@@ -7,58 +7,90 @@ on:
 jobs:
   desktop:
     runs-on: ubuntu-latest
-    timeout-minutes: 999  # 4時間まで生きる
+    timeout-minutes: 240  # 4時間まで生きる
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Desktop + noVNC + cloudflared
+      - name: Install Dependencies (Desktop + noVNC)
         run: |
           sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx cloudflared
+          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx
 
-      # パスワードは固定でもいいし、secretsにしてもOK（ここでは簡単のため固定）
+      - name: Install cloudflared (Ubuntu 24.04対応)
+        run: |
+          # 依存インストール
+          sudo apt update
+          sudo apt install -y apt-transport-https ca-certificates gnupg lsb-release
+          
+          # Cloudflare GPGキー追加
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          
+          # リポジトリ追加 (Ubuntu 24.04 = noble)
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg arch=$(dpkg --print-architecture)] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          
+          # 更新してインストール
+          sudo apt update
+          sudo apt install -y cloudflared
+
+      # VNC パスワード設定（固定値、必要に応じて secrets に変更）
       - name: Set VNC Password
         run: |
           mkdir -p ~/.vnc
           echo "github123" | vncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
 
-      - name: Start VNC Server (高フレームレート設定)
+      # VNC サーバー起動（高フレームレート・低遅延設定）
+      - name: Start VNC Server (Optimized)
         run: |
-          vncserver :1 -geometry 1600x900 -depth 24 -fps 60 &
+          vncserver :1 -geometry 1600x900 -depth 24 -fps 60 -compresslevel 1 -quality 7 &
           sleep 5
 
-      # noVNC を最適化（WebP無効化で遅延削減、turbo JPEG）
-      - name: Start noVNC (低遅延設定)
+      # noVNC 起動（低遅延: WebP無効、Turbo JPEG有効）
+      - name: Start noVNC (Low Latency)
         run: |
-          websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
-            --cert=~/self.pem --key=~/self.pem &
-          sleep 3
-
-      # Cloudflare Tunnel 起動（最速の方法）
-      - name: Cloudflare Tunnel (Quick Tunnel)
-        run: |
-          # Quick Tunnel（無料・即時公開）
-          cloudflared tunnel --url http://localhost:6080 --loglevel info &
+          # 自署名証明書生成（HTTPS必須）
+          openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout ~/self.key -out ~/self.crt -subj "/CN=localhost"
           
-          # 30秒待ってURLを取得（安定するまで待つ）
+          # websockify 起動（タイムアウト無効化）
+          websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
+            --cert=~/self.crt --key=~/self.key \
+            --idle-timeout=0 --timeout=0 --compression=0 &
+          sleep 5
+
+      # Cloudflare Tunnel 起動（Quick Tunnel で即時公開）
+      - name: Start Cloudflare Tunnel (Quick & Low Latency)
+        id: tunnel
+        run: |
+          # バックグラウンドでトンネル起動
+          nohup cloudflared tunnel --url http://localhost:6080 > tunnel.log 2>&1 &
+          
+          # URL 取得（安定するまで待機）
           echo "Waiting for tunnel URL..."
-          for i in {1..30}; do
-            URL=$(cloudflared tunnel route list --output json | jq -r '.[0].connections[0].origin_ip + ":443" | xargs -I {} echo "https://$(cloudflared tunnel --url http://localhost:6080 2>&1 | grep -o 'https://[^ ]*\.trycloudflare\.com')")
-            if [[ $URL == https://*.trycloudflare.com ]]; then
-              echo "=== YOUR DESKTOP IS READY ==="
-              echo "URL: $URL"
-              echo "URL=$URL" >> $GITHUB_OUTPUT
+          COUNTER=0
+          while [ $COUNTER -lt 60 ]; do
+            sleep 2
+            URL=$(grep -o 'https://.*\.trycloudflare\.com' tunnel.log | head -n1)
+            if [ ! -z "$URL" ]; then
+              echo "=== DESKTOP READY ==="
+              echo "Open this URL in your browser: $URL"
+              echo "VNC Password: github123"
+              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
               break
             fi
-            sleep 5
+            COUNTER=$((COUNTER+1))
           done
+          
+          if [ -z "$URL" ]; then
+            echo "Tunnel URL not found. Check logs."
+            cat tunnel.log
+            exit 1
+          fi
 
-      # もっと安定させたい場合は、事前にトンネル登録 + トークンを使う（後述）
-
-      - name: Keep alive (4時間)
+      # セッション保持（4時間）
+      - name: Keep Desktop Alive
         run: |
-          echo "Desktop will stay alive for 4 hours..."
-          sleep 999m
+          echo "Desktop is running at: ${{ steps.tunnel.outputs.tunnel_url }}"
+          echo "It will stay alive for 4 hours. Use Ctrl+C in browser to disconnect."
+          sleep 14400  # 4時間 = 14400秒
