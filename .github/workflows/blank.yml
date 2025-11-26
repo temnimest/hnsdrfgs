@@ -15,7 +15,7 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt update
-          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl unzip openssl
+          sudo apt install -y xfce4 xfce4-goodies tightvncserver novnc websockify nginx wget curl unzip openssl net-tools  # net-tools for netstat
 
       # 2. RustDesk Server（最新構造に完全対応）
       - name: Install RustDesk Server (hbbs & hbbr)
@@ -62,59 +62,62 @@ jobs:
           vncserver :1 -geometry 1600x900 -depth 24 -fps 60 -compresslevel 0 -quality 9 &
           sleep 8
 
-      # 6. RustDesk Server 起動 & ID/Key 取得（フラグ修正 + エラーキャプチャ）
+      # 6. RustDesk Server 起動（フラグ修正 + プロセス/ポート確認）
       - name: Start RustDesk Server
         id: rustdesk
         run: |
           # ログディレクトリ確認
           ls -la /var/log/rustdesk || echo "Log dir exists"
 
-          # hbbs 起動（-p フラグ削除: hbbsは固定ポート使用）
+          # hbbs 起動（-k _ 削除: デフォルトでキー生成）
           echo "Starting hbbs..."
-          nohup sudo hbbs -r /var/lib/rustdesk -k _ > /var/log/rustdesk/hbbs.log 2>&1 &
+          nohup sudo hbbs -r /var/lib/rustdesk > /var/log/rustdesk/hbbs.log 2>&1 &
           HBBS_PID=$!
-          sleep 5
+          sleep 10  # キー生成待機
 
-          # hbbs エラー確認（stderrキャプチャ）
+          # hbbs プロセス確認
           if ! sudo ps -p $HBBS_PID > /dev/null; then
-            echo "hbbs failed to start! Stderr:"
+            echo "hbbs failed to start! Log:"
             sudo cat /var/log/rustdesk/hbbs.log || echo "No log yet"
             exit 1
           fi
 
-          # hbbr 起動（-p フラグ削除）
+          # ポートリスニング確認（hbbsの21115/21116）
+          if ! netstat -tuln | grep -q ":21115\|:21116"; then
+            echo "hbbs ports not listening!"
+            netstat -tuln | grep 211
+            exit 1
+          fi
+
+          # hbbr 起動
           echo "Starting hbbr..."
-          nohup sudo hbbr -k _ > /var/log/rustdesk/hbbr.log 2>&1 &
+          nohup sudo hbbr > /var/log/rustdesk/hbbr.log 2>&1 &
           HBBR_PID=$!
           sleep 5
 
           if ! sudo ps -p $HBBR_PID > /dev/null; then
-            echo "hbbr failed to start!"
+            echo "hbbr failed to start! Log:"
+            sudo cat /var/log/rustdesk/hbbr.log
             exit 1
           fi
 
-          # IDとKeyを確実に取得（最大30秒待機、ログ複数チェック）
-          for i in {1..30}; do
-            sleep 1
-            ID=$(sudo tail -n 100 /var/log/rustdesk/hbbs.log | grep "ID:" | tail -1 | awk '{print $2}' || echo "")
-            KEY=$(sudo tail -n 100 /var/log/rustdesk/hbbs.log | grep "Key:" | tail -1 | awk '{print $2}' || echo "")
-            if [ -n "$ID" ] && [ -n "$KEY" ]; then
-              echo "hbbs log snippet:"
-              sudo tail -n 10 /var/log/rustdesk/hbbs.log
-              break
-            fi
-          done
-
-          if [ -z "$ID" ] || [ -z "$KEY" ]; then
-            echo "Failed to get RustDesk ID/Key. Full hbbs log:"
-            sudo cat /var/log/rustdesk/hbbs.log || echo "Log file still missing - hbbs crashed immediately"
+          # キー抽出（IDはクライアント接続時に生成）
+          sleep 5  # 追加待機
+          KEY=$(sudo tail -n 50 /var/log/rustdesk/hbbs.log | grep "Key:" | tail -1 | awk '{print $2}' || echo "")
+          if [ -z "$KEY" ]; then
+            echo "Failed to get RustDesk Key. Full log:"
+            sudo cat /var/log/rustdesk/hbbs.log
             exit 1
           fi
 
-          echo "RustDesk ID: $ID"
-          echo "RustDesk Key: $KEY"
-          echo "rustdesk_id=$ID" >> $GITHUB_OUTPUT
+          echo "RustDesk Server started successfully!"
+          echo "Generated Key: $KEY"
+          echo "Note: ID will be generated when a RustDesk client connects to the server."
           echo "rustdesk_key=$KEY" >> $GITHUB_OUTPUT
+
+          # ログスニペット表示
+          echo "hbbs log snippet:"
+          sudo tail -n 15 /var/log/rustdesk/hbbs.log
 
       # 7. noVNC 起動（低遅延設定 + HTTPS対応）
       - name: Start noVNC
@@ -165,9 +168,9 @@ jobs:
           echo "=== DESKTOP READY ==="
           echo "noVNC URL → $URL"
           echo "VNC Password → github123"
-          echo "RustDesk ID → ${{ steps.rustdesk.outputs.rustdesk_id }}"
           echo "RustDesk Key → ${{ steps.rustdesk.outputs.rustdesk_key }}"
-          echo "RustDesk Connect → rustdesk://${{ steps.rustdesk.outputs.rustdesk_id }}@rustdesk-${{ github.run_id }}.trycloudflare.com?key=${{ steps.rustdesk.outputs.rustdesk_key }}"
+          echo "RustDesk Server URL → rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
+          echo "RustDesk Connect → Connect via RustDesk client to generate ID"
 
           echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
 
@@ -180,10 +183,16 @@ jobs:
           echo ""
           echo "    VNC パスワード: github123"
           echo ""
-          echo "    RustDesk ID : ${{ steps.rustdesk.outputs.rustdesk_id }}"
-          echo "    RustDesk Key: ${{ steps.rustdesk.outputs.rustdesk_key }}"
-          echo "    RustDesk接続URL（クライアント用）:"
-          echo "    rustdesk://${{ steps.rustdesk.outputs.rustdesk_id }}@rustdesk-${{ github.run_id }}.trycloudflare.com?key=${{ steps.rustdesk.outputs.rustdesk_key }}"
+          echo "    RustDesk Server Key: ${{ steps.rustdesk.outputs.rustdesk_key }}"
+          echo "    RustDesk サーバーURL: rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
+          echo ""
+          echo "    📝 注意: RustDesk IDはクライアント接続時に自動生成されます。"
+          echo "      1. RustDeskクライアントを起動"
+          echo "      2. ID入力欄で「+」をクリック → サーバー追加"
+          echo "      3. サーバー: rustdesk-${{ github.run_id }}.trycloudflare.com:21115"
+          echo "      4. キー: ${{ steps.rustdesk.outputs.rustdesk_key }}"
+          echo "      5. 接続 → IDが自動生成・表示されます"
+          echo ""
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "このセッションは最大4時間有効です（タイムアウトまで待機中）"
           sleep 14400  # 4時間
