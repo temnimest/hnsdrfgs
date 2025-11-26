@@ -1,77 +1,102 @@
 name: Setup Desktop with RustDesk
 
 on:
-  workflow_dispatch:  # 手動トリガーで実行
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-latest  # 2025年11月時点の最新 Ubuntu ランナー
+
+    services:
+      # RustDesk サーバーのポートを公開（hbbs/hbbr 用）
+      rustdesk-server:
+        image: rustdesk/rustdesk-server:latest  # OSS 版 Docker イメージ（v1.1.14 相当）
+        ports:
+          - 21115:21115  # hbbs TCP
+          - 21116:21116  # hbbs UDP
+          - 21117:21117  # hbbr
+          - 21118:21118  # API (オプション)
+        env:
+          RELAY_HOST: localhost  # ローカルホストでリレー設定
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v4  # 最新アクション
 
     - name: Update system and install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y software-properties-common curl wget gnupg
+        sudo apt-get install -y wget curl xvfb x11vnc fluxbox tigervnc-standalone-server tigervnc-common dbus-x11 x11-utils  # VNC と軽量 WM (Fluxbox でシンプルに)
+        # RustDesk サーバー OSS バイナリを最新版ダウンロード (v1.1.14)
+        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4)
+        wget https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/rustdesk-server-linux-amd64.tar.gz
+        tar -xzf rustdesk-server-linux-amd64.tar.gz
+        sudo cp rustdesk-server-*/hbbs /usr/local/bin/
+        sudo cp rustdesk-server-*/hbbr /usr/local/bin/
+        sudo chmod +x /usr/local/bin/hb*
 
-    - name: Install XFCE desktop environment
+    - name: Generate RustDesk key pair
       run: |
-        # XFCE と軽量 VNC サーバーをインストール（デスクトップ GUI 構築）
-        sudo apt-add-repository universe
-        sudo apt-get update
-        sudo apt-get install -y xfce4 xfce4-goodies xorg-dbgsym dbus-x11 x11vnc xvfb
+        # Ed25519 キー生成 (RustDesk 必須)
+        openssl genpkey -algorithm ed25519 -out id_ed25519 -aes256  # パスワードなしで簡易生成
+        openssl pkey -in id_ed25519 -pubout -out id_ed25519.pub
+        sudo mkdir -p /opt/rustdesk
+        sudo cp id_ed* /opt/rustdesk/
+        export RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')  # 公開キー（クライアント設定用）
 
-    - name: Install RustDesk
+    - name: Start RustDesk Server (hbbs & hbbr)
       run: |
-        # 最新 deb パッケージをダウンロード（2025/11/27 時点: v1.2.6 相当、必要に応じてリリースページ確認）
-        wget https://github.com/rustdesk/rustdesk/releases/download/1.2.6/rustdesk-1.2.6-x86_64.deb
-        sudo apt-get install -fy ./rustdesk-1.2.6-x86_64.deb
-        rm rustdesk-1.2.6-x86_64.deb
+        # hbbs (ID サーバー) 起動
+        nohup hbbs -k /opt/rustdesk/id_ed25519 -r localhost:21117 > hbbs.log 2>&1 &
+        sleep 5
+        # hbbr (Relay サーバー) 起動
+        nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
+        sleep 5
+        # ログ確認
+        tail -f hbbs.log &  # バックグラウンドで監視
 
-    - name: Configure RustDesk as service
+    - name: Install RustDesk Client (v1.4.4)
       run: |
-        # RustDesk を systemd サービスとしてインストール（ヘッドレス起動）
-        sudo rustdesk --install-service
-        # 固定パスワードを設定（Secrets から取得推奨、セキュリティのためランダム生成例）
-        echo "${{ secrets.RUSTDESK_PASSWORD || 'RandomPass123!' }}" | sudo rustdesk --password-store
+        # 最新クライアント deb ダウンロード
+        wget https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb
+        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
+        # クライアントを自ホストサーバーに設定 (ID Server: localhost, Key: 生成キー)
+        export RUSTDESK_SERVER="localhost:21116"
+        rustdesk --set-id-server $RUSTDESK_SERVER --set-key $RUSTDESK_KEY --install-service
 
-    - name: Start desktop session and RustDesk
+    - name: Setup Desktop Environment (XFCE + VNC)
       run: |
-        # 仮想ディスプレイで XFCE を起動
+        sudo apt-get install -y xfce4 xfce4-goodies  # XFCE デスクトップ
+        # VNC サーバー設定 (ポート 5900 でヘッドレス)
+        echo "export DISPLAY=:99" >> ~/.bashrc
+        Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
+        sleep 2
         export DISPLAY=:99
-        Xvfb :99 -screen 0 1920x1080x24 &
+        # VNC パスワード設定 (デフォルト: password, 変更推奨)
+        x11vnc -storepasswd password ~/.vnc/passwd
+        # VNC 起動 (バックグラウンド)
+        nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
         sleep 5
-        dbus-launch --exit-with-session startxfce4 &
-        sleep 10  # デスクトップ起動待機
-        # RustDesk サービス起動
-        sudo systemctl start rustdeskd
-        sleep 5
+        # デスクトップ起動テスト
+        xsetroot -solid gray  # 背景設定
+        echo "Desktop environment ready. VNC on port 5900, RustDesk server on 21115-21118."
 
-    - name: Get RustDesk ID and Password
+    - name: Test Connection and Output Info
       run: |
-        # ID とパスワードを取得してログ出力（Web クライアントで使用）
-        ID=$(sudo rustdesk --get-id)
-        PASS=$(sudo rustdesk --get-password)
-        echo "RustDesk ID: $ID"
-        echo "RustDesk Password: $PASS"
-        echo "Use these credentials in RustDesk Web Client: https://rustdesk.com/web"
-        # 出力例: ID はランダム生成、PASS は設定値
+        # 接続テスト (RustDesk ID 取得)
+        rustdesk --get-id
+        # サーバーステータス
+        netstat -tuln | grep 211
+        netstat -tuln | grep 5900
+        echo "RustDesk Server Key: $RUSTDESK_KEY"  # クライアントで使用
+        echo "Access via Web Client: Use browser to connect to hbbs (e.g., wss://your-runner-ip:21115) with key above."
+        echo "VNC for direct desktop: vncviewer your-runner-ip:5900 (password: password)"
 
-    - name: Optional: Setup self-hosted server (hbbs/hbbr)
-      if: false  # デフォルトオフ、必要なら true に
+    - name: Cleanup (optional)
+      if: always()
       run: |
-        # 自ホストサーバー（オプション: Web コンソール統合）
-        sudo apt-get install -y docker.io docker-compose
-        sudo systemctl start docker
-        # hbbs/hbbr Docker 起動（ポート 21115-21117 開放、Actions では制限あり）
-        docker run --name hbbs -p 21115:21115 -p 21116:21116 -dt rustdesk/rustdesk-server hbbs -r 21117:21117
-        docker run --name hbbr -p 21117:21117 -dt rustdesk/rustdesk-server hbbr
-        # キー生成（/root/.config/rustdesk/id_ed25519.pub を使用）
-        sleep 10
-        PUB_KEY=$(docker exec hbbs cat /root/.config/rustdesk/id_ed25519.pub | base64)
-        echo "Self-hosted Public Key: $PUB_KEY"
-        # クライアント再設定: sudo rustdesk --server hbbs.yourdomain.com:21116 --key $PUB_KEY
+        pkill hbbs hbbr x11vnc Xvfb
