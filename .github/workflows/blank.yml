@@ -24,15 +24,20 @@ jobs:
           unzip rustdesk-server-linux-amd64.zip
 
           # 新構造（amd64/）にも旧構造にも対応（findで確実に拾う）
-          sudo find . -type f -name "hbbs" -exec mv {} /usr/local/bin/hbbs \; 
+          sudo find . -type f -name "hbbs" -exec mv {} /usr/local/bin/hbbs \;
           sudo find . -type f -name "hbbr" -exec mv {} /usr/local/bin/hbbr \;
+
+          # バイナリ確認（デバッグ用）
+          which hbbs || (echo "hbbs not found!" && exit 1)
+          which hbbr || (echo "hbbr not found!" && exit 1)
 
           # クリーンアップ
           rm -rf amd64 rustdesk-server-linux-amd64 rustdesk-server-linux-amd64.zip
 
-          # 必要ディレクトリ作成
+          # 必要ディレクトリ作成（権限設定）
           sudo mkdir -p /var/lib/rustdesk /var/log/rustdesk
           sudo chmod 755 /var/lib/rustdesk /var/log/rustdesk
+          sudo chown -R $USER:$USER /var/log/rustdesk  # ログ書き込み権限
 
       # 3. cloudflared インストール（Ubuntu 24.04対応）
       - name: Install cloudflared
@@ -57,25 +62,52 @@ jobs:
           vncserver :1 -geometry 1600x900 -depth 24 -fps 60 -compresslevel 0 -quality 9 &
           sleep 8
 
-      # 6. RustDesk Server 起動 & ID/Key 取得
+      # 6. RustDesk Server 起動 & ID/Key 取得（フラグ修正 + エラーキャプチャ）
       - name: Start RustDesk Server
         id: rustdesk
         run: |
-          nohup sudo hbbs -r /var/lib/rustdesk -k _ > /var/log/rustdesk/hbbs.log 2>&1 &
-          nohup sudo hbbr -k _ > /var/log/rustdesk/hbbr.log 2>&1 &
-          sleep 10
+          # ログディレクトリ確認
+          ls -la /var/log/rustdesk || echo "Log dir exists"
 
-          # IDとKeyを確実に取得（最大30秒待機）
+          # hbbs 起動（-p フラグ削除: hbbsは固定ポート使用）
+          echo "Starting hbbs..."
+          nohup sudo hbbs -r /var/lib/rustdesk -k _ > /var/log/rustdesk/hbbs.log 2>&1 &
+          HBBS_PID=$!
+          sleep 5
+
+          # hbbs エラー確認（stderrキャプチャ）
+          if ! sudo ps -p $HBBS_PID > /dev/null; then
+            echo "hbbs failed to start! Stderr:"
+            sudo cat /var/log/rustdesk/hbbs.log || echo "No log yet"
+            exit 1
+          fi
+
+          # hbbr 起動（-p フラグ削除）
+          echo "Starting hbbr..."
+          nohup sudo hbbr -k _ > /var/log/rustdesk/hbbr.log 2>&1 &
+          HBBR_PID=$!
+          sleep 5
+
+          if ! sudo ps -p $HBBR_PID > /dev/null; then
+            echo "hbbr failed to start!"
+            exit 1
+          fi
+
+          # IDとKeyを確実に取得（最大30秒待機、ログ複数チェック）
           for i in {1..30}; do
-            ID=$(grep "ID:" /var/log/rustdesk/hbbs.log | tail -1 | awk '{print $2}')
-            KEY=$(grep "Key:" /var/log/rustdesk/hbbs.log | tail -1 | awk '{print $2}')
-            [ -n "$ID" ] && [ -n "$KEY" ] && break
-            sleep 2
+            sleep 1
+            ID=$(sudo tail -n 100 /var/log/rustdesk/hbbs.log | grep "ID:" | tail -1 | awk '{print $2}' || echo "")
+            KEY=$(sudo tail -n 100 /var/log/rustdesk/hbbs.log | grep "Key:" | tail -1 | awk '{print $2}' || echo "")
+            if [ -n "$ID" ] && [ -n "$KEY" ]; then
+              echo "hbbs log snippet:"
+              sudo tail -n 10 /var/log/rustdesk/hbbs.log
+              break
+            fi
           done
 
           if [ -z "$ID" ] || [ -z "$KEY" ]; then
-            echo "Failed to get RustDesk ID/Key"
-            tail -50 /var/log/rustdesk/hbbs.log
+            echo "Failed to get RustDesk ID/Key. Full hbbs log:"
+            sudo cat /var/log/rustdesk/hbbs.log || echo "Log file still missing - hbbs crashed immediately"
             exit 1
           fi
 
@@ -92,8 +124,7 @@ jobs:
 
           websockify --web=/usr/share/novnc/ 6080 localhost:5901 \
             --cert=~/self.crt --key=~/self.key \
-            --idle-timeout=0 --timeout=0 \
-            -v --run-once &  # run-onceは不要なので削除可
+            --idle-timeout=0 --timeout=0 &
           sleep 5
 
       # 8. Cloudflare Tunnel 起動（noVNC + RustDesk 全ポート対応）
@@ -120,9 +151,9 @@ jobs:
 
           echo "Waiting for tunnel to be ready..."
           for i in {1..60}; do
+            sleep 3
             URL=$(grep -o 'https://novnc-.*\.trycloudflare\.com' tunnel.log | head -1)
             [ -n "$URL" ] && break
-            sleep 3
           done
 
           if [ -z "$URL" ]; then
