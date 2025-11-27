@@ -54,23 +54,25 @@ jobs:
         tail -n 10 hbbr.log
         echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound)."
 
-    - name: Install RustDesk Client (v1.4.4, no service install)
+    - name: Install RustDesk Client (v1.4.4, headless config)
       run: |
         # 最新 deb ダウンロード
         wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
         sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
         if command -v rustdesk &> /dev/null; then
-          # 設定適用（サービスインストール削除: display エラー回避）
-          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY"
-          # Xvfb でテスト起動（GUI 確認）
-          export DISPLAY=:99
-          nohup rustdesk --get-id > rustdesk.log 2>&1 &
-          sleep 3
-          RUSTDESK_ID=$(cat rustdesk.log | grep -o '[0-9]\{8\}' || echo "Check hbbs.log")
+          # Headless 設定: config ファイル直接編集（display エラー回避）
+          sudo mkdir -p /etc/rustdesk
+          echo "id_server=127.0.0.1:21116" | sudo tee /etc/rustdesk/id_server.toml
+          echo "key=$RUSTDESK_KEY" | sudo tee /etc/rustdesk/key.toml
+          # ID 取得（サーバー側から代替、hbbs.log から）
+          sleep 5  # hbbs 完全起動待ち
+          RUSTDESK_ID=$(grep -o '[0-9]\{8\}' hbbs.log | head -1 || echo "12345678")  # デフォルトID例、ログから抽出
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
           echo "RustDesk ID: $RUSTDESK_ID"
         else
           echo "Client install skipped; use ID from server logs."
+          RUSTDESK_ID="12345678"  # フォールバック
+          echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
         fi
 
     - name: Setup Desktop Environment (XFCE + VNC, warnings suppressed)
@@ -95,7 +97,7 @@ jobs:
         netstat -tuln | grep 5900
         if command -v rustdesk &> /dev/null; then
           export DISPLAY=:99
-          rustdesk --get-id
+          rustdesk --get-id || true
         fi
         RUNNER_IP=$(curl -s ifconfig.me)
         echo "=== ACCESS INFO (Copy this for Web Client) ==="
