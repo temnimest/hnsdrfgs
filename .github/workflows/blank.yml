@@ -54,14 +54,19 @@ jobs:
         tail -n 10 hbbr.log
         echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound)."
 
-    - name: Install RustDesk Client (v1.4.4)
+    - name: Install RustDesk Client (v1.4.4, no service install)
       run: |
         # 最新 deb ダウンロード
         wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
         sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
         if command -v rustdesk &> /dev/null; then
-          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service
-          RUSTDESK_ID=$(rustdesk --get-id)
+          # 設定適用（サービスインストール削除: display エラー回避）
+          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY"
+          # Xvfb でテスト起動（GUI 確認）
+          export DISPLAY=:99
+          nohup rustdesk --get-id > rustdesk.log 2>&1 &
+          sleep 3
+          RUSTDESK_ID=$(cat rustdesk.log | grep -o '[0-9]\{8\}' || echo "Check hbbs.log")
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
           echo "RustDesk ID: $RUSTDESK_ID"
         else
@@ -89,6 +94,7 @@ jobs:
         netstat -tuln | grep 211
         netstat -tuln | grep 5900
         if command -v rustdesk &> /dev/null; then
+          export DISPLAY=:99
           rustdesk --get-id
         fi
         RUNNER_IP=$(curl -s ifconfig.me)
