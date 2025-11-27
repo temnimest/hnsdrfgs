@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       rdp_password:
-        description: 'RDP接続用のパスワード (runnerユーザー)'
+        description: 'RDP接続用のパスワード (runneradminユーザー)'
         required: true
         type: string
       rustdesk_password:
@@ -30,8 +30,16 @@ jobs:
           # ワークフロー入力からパスワードを取得
           $rdpPassword = "${{ github.event.inputs.rdp_password }}"
           
-          # runnerユーザーのパスワードを設定
-          net user runner $rdpPassword
+          # runneradminユーザーのパスワードを設定
+          # デフォルトのユーザーは 'runner' ではなく 'runneradmin'
+          Write-Host "Setting password for 'runneradmin' user..."
+          net user runneradmin $rdpPassword
+          
+          # コマンドが成功したか確認
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to set password for runneradmin user."
+            exit 1
+          }
           
           # レジストリを変更してRDPを有効化
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
@@ -41,16 +49,24 @@ jobs:
           
           # パスワードをログに出力しないようにマスク
           Write-Output "::add-mask::$rdpPassword"
-          Write-Host "RDP has been enabled for user 'runner'."
+          Write-Host "RDP has been enabled for user 'runneradmin'."
 
-      - name: '2: RustDeskをダウンロードして展開'
+      - name: '2: RustDeskの最新版をダウンロードして展開'
         shell: powershell
         run: |
-          # RustDeskの最新ポータブル版をダウンロード (URLは将来変更される可能性があります)
-          # 公式サイトやGitHub Releasesで最新のURLを確認してください
-          $rustdeskUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64-pc-windows-msvc.zip"
+          # GitHub APIを使って最新リリース情報を取得
+          $releaseInfo = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          $rustdeskAsset = $releaseInfo.assets | Where-Object { $_.name -like "*-x86_64-pc-windows-msvc.zip" }
+          
+          if (-not $rustdeskAsset) {
+            Write-Error "Could not find RustDesk portable asset for Windows x64."
+            exit 1
+          }
+          
+          $rustdeskUrl = $rustdeskAsset.browser_download_url
           $outputPath = "rustdesk.zip"
           
+          Write-Host "Downloading RustDesk from: $rustdeskUrl"
           Invoke-WebRequest -Uri $rustdeskUrl -OutFile $outputPath
           Expand-Archive -Path $outputPath -DestinationPath .\rustdesk
           Write-Host "RustDesk downloaded and extracted."
@@ -64,33 +80,33 @@ jobs:
           Start-Process -FilePath ".\rustdesk\rustdesk.exe" -ArgumentList "--password", $rustdeskPassword
           
           # RustDeskが設定ファイルを生成するまで少し待機
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 15 # 待機時間を少し増やす
           
           # 設定ファイルから接続IDを読み込む
           # 設定ファイルの場所: %APPDATA%\RustDesk\config\RustDesk.toml
-          $configPath = "$env:APPDATA\RustDesk\config\RustDesk.toml"
+          $configPath = "$env:APPDATA\Rustdesk\config\RustDesk.toml"
           
           # ファイルが確実に生成されるまで待機（ループで確認）
-          $timeout = 30
+          $timeout = 60 # タイムアウトを延長
           $timer = 0
           while (-not (Test-Path $configPath) -and $timer -lt $timeout) {
-            Start-Sleep -Seconds 1
+            Start-Sleep -Seconds 2
             $timer++
           }
 
           if (Test-Path $configPath) {
             $configContent = Get-Content $configPath
-            $idLine = $configContent | Where-Object { $_ -match '^\s*id\s*=\s*(\d+)' }
-            if ($idLine) {
+            # 正規表現でIDを抽出
+            if ($configContent -match 'id\s*=\s*["\']?(\d+)["\']?') {
               $rustdeskId = $matches[1]
               Write-Output "rustdesk_id=$rustdeskId" >> $env:GITHUB_ENV
               Write-Host "RustDesk ID: $rustdeskId"
             } else {
-              Write-Error "Could not find RustDesk ID in config file."
+              Write-Error "Could not find RustDesk ID in config file at $configPath."
               exit 1
             }
           } else {
-            Write-Error "RustDesk config file not found after waiting."
+            Write-Error "RustDesk config file not found after waiting for $timeout seconds."
             exit 1
           }
           
@@ -124,8 +140,8 @@ jobs:
           **注意:** GitHub ActionsのRunnerは一般的に外部からの直接RDP接続を許可していません。この情報は、同じ仮想ネットワーク内からアクセスする場合などに限られます。通常はRustDeskをご利用ください。
 
           - **Computer Name (Host):** `localhost` (Runner内でのみ有効)
-          - **Username:** `runner`
-          - **Password:** `${{ github.event.inputs.rustdesk_password }}`
+          - **Username:** `runneradmin`
+          - **Password:** `${{ github.event.inputs.rdp_password }}`
           "@
           
           # サマリーに出力
