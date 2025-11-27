@@ -35,44 +35,44 @@ jobs:
         echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV
         echo "Generated Key: $RUSTDESK_KEY"
 
-    - name: Start RustDesk Server (hbbs & hbbr バイナリ実行)
+    - name: Start RustDesk Server (hbbs & hbbr バイナリ実行、ポート競合回避)
       run: |
-        # TCP ポートフォワード（自動バインド、外部アクセス用）
+        # TCP ポートフォワード（hbbr を 21120 に変更、競合回避）
         sudo socat TCP-LISTEN:21115,reuseaddr,fork TCP:127.0.0.1:21115 &
         sudo socat TCP-LISTEN:21116,reuseaddr,fork TCP:127.0.0.1:21116 &
-        sudo socat TCP-LISTEN:21117,reuseaddr,fork TCP:127.0.0.1:21117 &
+        sudo socat TCP-LISTEN:21117,reuseaddr,fork TCP:127.0.0.1:21120 &  # hbbr 内部ポート 21120
         sudo socat TCP-LISTEN:21118,reuseaddr,fork TCP:127.0.0.1:21118 &
         sudo socat TCP-LISTEN:21119,reuseaddr,fork TCP:127.0.0.1:21119 &
         sleep 3
         # hbbs 起動
-        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21117 > hbbs.log 2>&1 &
+        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21120 > hbbs.log 2>&1 &
         sleep 5
-        # hbbr 起動
-        nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
+        # hbbr 起動（ポート 21120）
+        nohup hbbr -k /opt/rustdesk/id_ed25519 -p 21120 > hbbr.log 2>&1 &
         sleep 5
         tail -n 10 hbbs.log
         tail -n 10 hbbr.log
-        echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound)."
+        echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound, hbbr internal:21120)."
 
-    - name: Install RustDesk Client (v1.4.4, headless config)
+    - name: Install RustDesk Client (v1.4.4, optional headless)
       run: |
-        # 最新 deb ダウンロード
+        # 最新 deb ダウンロード（確認済みアセット名）
         wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
-        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
+        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y || echo "Install failed, skipping client (use server-side ID)"
         if command -v rustdesk &> /dev/null; then
-          # Xvfb で設定適用（display エラー回避）
+          # Headless 設定: config ファイル編集
+          sudo mkdir -p /opt/rustdesk/config
+          echo "[options]\nid_server = '127.0.0.1:21116'\nkey = '$RUSTDESK_KEY'" | sudo tee /opt/rustdesk/config/RustDesk.toml > /dev/null
+          # Xvfb で ID 取得テスト（display エラー回避）
           export DISPLAY=:99
-          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY"
-          # クライアント起動して ID 取得（自動生成）
-          nohup rustdesk > rustdesk.log 2>&1 &
-          sleep 10  # 起動・登録待ち
-          RUSTDESK_ID=$(rustdesk --get-id || echo "12345678")  # デフォルトフォールバック
+          timeout 10 rustdesk --get-id > rustdesk_id.log 2>/dev/null || echo "Failed to get ID via client, using demo ID"
+          RUSTDESK_ID=$(grep -o '[0-9]\{8\}' rustdesk_id.log | head -1 || echo "12345678")  # デモ ID フォールバック
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
-          echo "RustDesk ID: $RUSTDESK_ID"
+          echo "RustDesk ID (from client): $RUSTDESK_ID"
         else
-          echo "Client install skipped; use default ID."
-          RUSTDESK_ID="12345678"
+          RUSTDESK_ID="12345678"  # フォールバック（サーバー側で使用）
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
+          echo "RustDesk ID (fallback): $RUSTDESK_ID"
         fi
 
     - name: Setup Desktop Environment (XFCE + VNC, warnings suppressed)
@@ -97,13 +97,13 @@ jobs:
         netstat -tuln | grep 5900
         if command -v rustdesk &> /dev/null; then
           export DISPLAY=:99
-          rustdesk --get-id
+          rustdesk --get-id || true
         fi
         RUNNER_IP=$(curl -s ifconfig.me)
         echo "=== ACCESS INFO (Copy this for Web Client) ==="
         echo "Runner IP: $RUNNER_IP (ports auto-exposed)"
         echo "RustDesk Key: $RUSTDESK_KEY"
-        echo "RustDesk ID: ${RUSTDESK_ID:-'Check rustdesk.log'}"
+        echo "RustDesk ID: ${RUSTDESK_ID:-'Check rustdesk_id.log or hbbs.log'}"
         echo "Web Client Config:"
         echo "  ID Server: $RUNNER_IP:21116"
         echo "  Key: $RUSTDESK_KEY"
@@ -121,7 +121,7 @@ jobs:
       run: |
         echo "Demo mode active. Services running... Monitor logs for stability."
         echo "Cancel this job manually when done."
-        tail -f hbbs.log vnc.log xfce.log rustdesk.log &  # ログ監視（継続）
+        tail -f hbbs.log hbbr.log vnc.log xfce.log rustdesk_id.log &  # ログ監視（hbbr追加）
         sleep infinity  # ジョブを無限継続
       timeout-minutes: 0  # このステップ無制限
 
