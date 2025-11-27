@@ -60,18 +60,18 @@ jobs:
         wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
         sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
         if command -v rustdesk &> /dev/null; then
-          # Headless 設定: config ファイル直接編集（display エラー回避）
-          sudo mkdir -p /etc/rustdesk
-          echo "id_server=127.0.0.1:21116" | sudo tee /etc/rustdesk/id_server.toml
-          echo "key=$RUSTDESK_KEY" | sudo tee /etc/rustdesk/key.toml
-          # ID 取得（サーバー側から代替、hbbs.log から）
-          sleep 5  # hbbs 完全起動待ち
-          RUSTDESK_ID=$(grep -o '[0-9]\{8\}' hbbs.log | head -1 || echo "12345678")  # デフォルトID例、ログから抽出
+          # Xvfb で設定適用（display エラー回避）
+          export DISPLAY=:99
+          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY"
+          # クライアント起動して ID 取得（自動生成）
+          nohup rustdesk > rustdesk.log 2>&1 &
+          sleep 10  # 起動・登録待ち
+          RUSTDESK_ID=$(rustdesk --get-id || echo "12345678")  # デフォルトフォールバック
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
           echo "RustDesk ID: $RUSTDESK_ID"
         else
-          echo "Client install skipped; use ID from server logs."
-          RUSTDESK_ID="12345678"  # フォールバック
+          echo "Client install skipped; use default ID."
+          RUSTDESK_ID="12345678"
           echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
         fi
 
@@ -97,13 +97,13 @@ jobs:
         netstat -tuln | grep 5900
         if command -v rustdesk &> /dev/null; then
           export DISPLAY=:99
-          rustdesk --get-id || true
+          rustdesk --get-id
         fi
         RUNNER_IP=$(curl -s ifconfig.me)
         echo "=== ACCESS INFO (Copy this for Web Client) ==="
         echo "Runner IP: $RUNNER_IP (ports auto-exposed)"
         echo "RustDesk Key: $RUSTDESK_KEY"
-        echo "RustDesk ID: ${RUSTDESK_ID:-'Check hbbs.log'}"
+        echo "RustDesk ID: ${RUSTDESK_ID:-'Check rustdesk.log'}"
         echo "Web Client Config:"
         echo "  ID Server: $RUNNER_IP:21116"
         echo "  Key: $RUSTDESK_KEY"
@@ -121,7 +121,7 @@ jobs:
       run: |
         echo "Demo mode active. Services running... Monitor logs for stability."
         echo "Cancel this job manually when done."
-        tail -f hbbs.log vnc.log xfce.log &  # ログ監視（継続）
+        tail -f hbbs.log vnc.log xfce.log rustdesk.log &  # ログ監視（継続）
         sleep infinity  # ジョブを無限継続
       timeout-minutes: 0  # このステップ無制限
 
