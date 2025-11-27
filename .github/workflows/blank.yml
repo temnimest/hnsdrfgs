@@ -1,133 +1,20 @@
-name: Setup Desktop with RustDesk (Persistent Demo)
+server {
+    listen 443 ssl;
+    server_name your-domain;  # 任意ドメイン
+    ssl_certificate /path/to/cert.pem;  # self-signed でもOK
+    ssl_certificate_key /path/to/key.pem;
 
-on:
-  workflow_dispatch:  # 手動実行専用（push/PR 除外で安定）
+    location /ws-hbbs {
+        proxy_pass http://RUNNER_IP:21118;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
 
-jobs:
-  setup:
-    runs-on: ubuntu-latest  # Ubuntu 24.04 (2025年11月時点)
-    timeout-minutes: 360  # 6時間延長（デモ継続用）
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4  # 最新版
-
-    - name: Update system and install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat net-tools  # net-tools で netstat
-        # RustDesk サーバー OSS バイナリを最新版 (v1.1.14) ダウンロード（正しいZIP名）
-        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-        echo "Latest server version: $LATEST_SERVER"
-        wget "https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/rustdesk-server-linux-amd64.zip"
-        unzip -o "rustdesk-server-linux-amd64.zip" -d server/
-        sudo cp server/hb* /usr/local/bin/
-        sudo chmod +x /usr/local/bin/hb*
-        echo "Server binaries installed."
-
-    - name: Generate RustDesk key pair (Ed25519)
-      run: |
-        openssl genpkey -algorithm ed25519 -out id_ed25519
-        openssl pkey -in id_ed25519 -pubout -out id_ed25519.pub
-        sudo mkdir -p /opt/rustdesk
-        sudo cp id_ed* /opt/rustdesk/
-        RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
-        echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV
-        echo "Generated Key: $RUSTDESK_KEY"
-
-    - name: Start RustDesk Server (hbbs & hbbr バイナリ実行)
-      run: |
-        # TCP ポートフォワード（自動バインド、外部アクセス用）
-        sudo socat TCP-LISTEN:21115,reuseaddr,fork TCP:127.0.0.1:21115 &
-        sudo socat TCP-LISTEN:21116,reuseaddr,fork TCP:127.0.0.1:21116 &
-        sudo socat TCP-LISTEN:21117,reuseaddr,fork TCP:127.0.0.1:21117 &
-        sudo socat TCP-LISTEN:21118,reuseaddr,fork TCP:127.0.0.1:21118 &
-        sudo socat TCP-LISTEN:21119,reuseaddr,fork TCP:127.0.0.1:21119 &
-        sleep 3
-        # hbbs 起動
-        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21117 > hbbs.log 2>&1 &
-        sleep 5
-        # hbbr 起動
-        nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
-        sleep 5
-        tail -n 10 hbbs.log
-        tail -n 10 hbbr.log
-        echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound)."
-
-    - name: Install RustDesk Client (v1.4.4)
-      run: |
-        # 最新 deb ダウンロード
-        wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
-        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
-        if command -v rustdesk &> /dev/null; then
-          rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service
-          RUSTDESK_ID=$(rustdesk --get-id)
-          echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
-          echo "RustDesk ID: $RUSTDESK_ID"
-        else
-          echo "Client install skipped; use ID from server logs."
-        fi
-
-    - name: Setup Desktop Environment (XFCE + VNC, warnings suppressed)
-      run: |
-        sudo apt-get install -y xfce4 xfce4-goodies xorg
-        export DISPLAY=:99
-        Xvfb :99 -screen 0 1024x768x24 > xvfb.log 2>&1 &
-        sleep 3
-        mkdir -p ~/.vnc
-        echo "password" | x11vnc -storepasswd - -usepw > /dev/null
-        nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
-        sleep 5
-        export DISPLAY=:99
-        xsetroot -solid lightblue
-        startxfce4 > xfce.log 2>/dev/null &  # 警告抑制
-        sleep 10
-        echo "Desktop ready. VNC: localhost:5900 (password: password)."
-
-    - name: Test Connection and Output Access Info
-      run: |
-        netstat -tuln | grep 211
-        netstat -tuln | grep 5900
-        if command -v rustdesk &> /dev/null; then
-          rustdesk --get-id
-        fi
-        RUNNER_IP=$(curl -s ifconfig.me)
-        echo "=== ACCESS INFO (Copy this for Web Client) ==="
-        echo "Runner IP: $RUNNER_IP (ports auto-exposed)"
-        echo "RustDesk Key: $RUSTDESK_KEY"
-        echo "RustDesk ID: ${RUSTDESK_ID:-'Check hbbs.log'}"
-        echo "Web Client Config:"
-        echo "  ID Server: $RUNNER_IP:21116"
-        echo "  Key: $RUSTDESK_KEY"
-        echo "  Relay: $RUNNER_IP:21117"
-        echo "  WebSocket hbbs: wss://$RUNNER_IP:21118"
-        echo "  WebSocket hbbr: wss://$RUNNER_IP:21119"
-        echo "VNC Direct: vncviewer $RUNNER_IP:5900 (password: password)"
-        echo "Build Web Client: https://github.com/rustdesk/rustdesk/tree/master/web"
-        echo "  Edit config.js: idServer = '$RUNNER_IP:21116'; key = '$RUSTDESK_KEY';"
-        echo "HTTPS Proxy (Optional, local Nginx): Use sample conf below."
-        echo "============================================"
-
-    - name: Persistent Demo Mode (Keep Running Indefinitely)
-      # 無限ループでジョブ継続（手動キャンセルで停止）
-      run: |
-        echo "Demo mode active. Services running... Monitor logs for stability."
-        echo "Cancel this job manually when done."
-        tail -f hbbs.log vnc.log xfce.log &  # ログ監視（継続）
-        sleep infinity  # ジョブを無限継続
-      timeout-minutes: 0  # このステップ無制限
-
-    - name: Cleanup (only if not cancelled)
-      if: always() && !cancelled()
-      run: |
-        echo "Stopping services..."
-        sudo pkill -f hbbs || true
-        sudo pkill -f hbbr || true
-        sudo pkill -f x11vnc || true
-        sudo pkill -f Xvfb || true
-        sudo pkill -f rustdesk || true
-        sudo pkill -f startxfce4 || true
-        sudo pkill -f xfce4 || true
-        sudo pkill -f socat || true
-        sleep 2
-        echo "Cleanup completed."
+    location /ws-hbbr {
+        proxy_pass http://RUNNER_IP:21119;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+}
