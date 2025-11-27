@@ -1,141 +1,142 @@
-name: Setup Desktop with RustDesk (Persistent Demo)
+name: 'Windows Desktop with RustDesk'
 
 on:
-  workflow_dispatch:  # 手動実行専用（push/PR 除外で安定）
+  workflow_dispatch:
+    inputs:
+      rdp_password:
+        description: 'RDP接続用のパスワード (runnerユーザー)'
+        required: true
+        type: string
+      rustdesk_password:
+        description: 'RustDesk接続用のパスワード'
+        required: true
+        type: string
+      hold_time_minutes:
+        description: 'デスクトップ環境を保持する時間 (分)'
+        required: true
+        default: '60'
+        type: string
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest  # Ubuntu 24.04 (2025年11月時点)
-    timeout-minutes: 360  # 6時間延長（デモ継続用）
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4  # 最新版
+      - name: '1: RDPを有効化'
+        shell: powershell
+        run: |
+          # ワークフロー入力からパスワードを取得
+          $rdpPassword = "${{ github.event.inputs.rdp_password }}"
+          
+          # runnerユーザーのパスワードを設定
+          net user runner $rdpPassword
+          
+          # レジストリを変更してRDPを有効化
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -value 0
+          
+          # ファイアウォールでRDPポートを許可
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          
+          # パスワードをログに出力しないようにマスク
+          Write-Output "::add-mask::$rdpPassword"
+          Write-Host "RDP has been enabled for user 'runner'."
 
-    - name: Update system and install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat net-tools  # net-tools で netstat
-        # RustDesk サーバー OSS バイナリを最新版 (v1.1.14) ダウンロード（正しいZIP名）
-        LATEST_SERVER=$(curl -s https://api.github.com/repos/rustdesk/rustdesk-server/releases/latest | grep "tag_name" | cut -d '"' -f 4)
-        echo "Latest server version: $LATEST_SERVER"
-        wget "https://github.com/rustdesk/rustdesk-server/releases/download/${LATEST_SERVER}/rustdesk-server-linux-amd64.zip"
-        unzip -o "rustdesk-server-linux-amd64.zip" -d server/
-        sudo cp server/amd64/hb* /usr/local/bin/
-        sudo chmod +x /usr/local/bin/hb*
-        echo "Server binaries installed."
+      - name: '2: RustDeskをダウンロードして展開'
+        shell: powershell
+        run: |
+          # RustDeskの最新ポータブル版をダウンロード (URLは将来変更される可能性があります)
+          # 公式サイトやGitHub Releasesで最新のURLを確認してください
+          $rustdeskUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64-pc-windows-msvc.zip"
+          $outputPath = "rustdesk.zip"
+          
+          Invoke-WebRequest -Uri $rustdeskUrl -OutFile $outputPath
+          Expand-Archive -Path $outputPath -DestinationPath .\rustdesk
+          Write-Host "RustDesk downloaded and extracted."
 
-    - name: Generate RustDesk key pair (Ed25519)
-      run: |
-        openssl genpkey -algorithm ed25519 -out id_ed25519
-        openssl pkey -in id_ed25519 -pubout -out id_ed25519.pub
-        sudo mkdir -p /opt/rustdesk
-        sudo cp id_ed* /opt/rustdesk/
-        RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
-        echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV
-        echo "Generated Key: $RUSTDESK_KEY"
+      - name: '3: RustDeskを起動して接続IDを取得'
+        shell: powershell
+        run: |
+          $rustdeskPassword = "${{ github.event.inputs.rustdesk_password }}"
+          
+          # RustDeskをパスワード付きでバックグラウンドで起動
+          Start-Process -FilePath ".\rustdesk\rustdesk.exe" -ArgumentList "--password", $rustdeskPassword
+          
+          # RustDeskが設定ファイルを生成するまで少し待機
+          Start-Sleep -Seconds 10
+          
+          # 設定ファイルから接続IDを読み込む
+          # 設定ファイルの場所: %APPDATA%\RustDesk\config\RustDesk.toml
+          $configPath = "$env:APPDATA\RustDesk\config\RustDesk.toml"
+          
+          # ファイルが確実に生成されるまで待機（ループで確認）
+          $timeout = 30
+          $timer = 0
+          while (-not (Test-Path $configPath) -and $timer -lt $timeout) {
+            Start-Sleep -Seconds 1
+            $timer++
+          }
 
-    - name: Start RustDesk Server (hbbs & hbbr バイナリ実行、ポート競合回避)
-      run: |
-        # TCP ポートフォワード（hbbr を 21120 に変更、競合回避）
-        sudo socat TCP-LISTEN:21115,reuseaddr,fork TCP:127.0.0.1:21115 &
-        sudo socat TCP-LISTEN:21116,reuseaddr,fork TCP:127.0.0.1:21116 &
-        sudo socat TCP-LISTEN:21117,reuseaddr,fork TCP:127.0.0.1:21120 &  # hbbr 内部ポート 21120
-        sudo socat TCP-LISTEN:21118,reuseaddr,fork TCP:127.0.0.1:21118 &
-        sudo socat TCP-LISTEN:21119,reuseaddr,fork TCP:127.0.0.1:21119 &
-        sleep 3
-        # hbbs 起動
-        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21120 > hbbs.log 2>&1 &
-        sleep 5
-        # hbbr 起動（ポート 21120）
-        nohup hbbr -k /opt/rustdesk/id_ed25519 -p 21120 > hbbr.log 2>&1 &
-        sleep 5
-        tail -n 10 hbbs.log
-        tail -n 10 hbbr.log
-        echo "RustDesk Server running on ports 21115-21119 (TCP auto-bound, hbbr internal:21120)."
+          if (Test-Path $configPath) {
+            $configContent = Get-Content $configPath
+            $idLine = $configContent | Where-Object { $_ -match '^\s*id\s*=\s*(\d+)' }
+            if ($idLine) {
+              $rustdeskId = $matches[1]
+              Write-Output "rustdesk_id=$rustdeskId" >> $env:GITHUB_ENV
+              Write-Host "RustDesk ID: $rustdeskId"
+            } else {
+              Write-Error "Could not find RustDesk ID in config file."
+              exit 1
+            }
+          } else {
+            Write-Error "RustDesk config file not found after waiting."
+            exit 1
+          }
+          
+          # パスワードをマスク
+          Write-Output "::add-mask::$rustdeskPassword"
+          Write-Host "RustDesk started with password."
 
-    - name: Install RustDesk Client (v1.4.4, optional headless)
-      run: |
-        # 最新 deb ダウンロード（確認済みアセット名）
-        wget "https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb"
-        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y || echo "Install failed, skipping client (use server-side ID)"
-        if command -v rustdesk &> /dev/null; then
-          # Headless 設定: config ファイル編集
-          sudo mkdir -p /opt/rustdesk/config
-          echo "[options]\nid_server = '127.0.0.1:21116'\nkey = '$RUSTDESK_KEY'" | sudo tee /opt/rustdesk/config/RustDesk.toml > /dev/null
-          # Xvfb で ID 取得テスト（display エラー回避）
-          export DISPLAY=:99
-          timeout 10 rustdesk --get-id > rustdesk_id.log 2>/dev/null || echo "Failed to get ID via client, using demo ID"
-          RUSTDESK_ID=$(grep -o '[0-9]\{8\}' rustdesk_id.log | head -1 || echo "12345678")  # デモ ID フォールバック
-          echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
-          echo "RustDesk ID (from client): $RUSTDESK_ID"
-        else
-          RUSTDESK_ID="12345678"  # フォールバック（サーバー側で使用）
-          echo "RUSTDESK_ID=$RUSTDESK_ID" >> $GITHUB_ENV
-          echo "RustDesk ID (fallback): $RUSTDESK_ID"
-        fi
+      - name: '4: 接続情報をサマリーに表示'
+        shell: powershell
+        run: |
+          # GitHubのUIで見やすいようにサマリーを作成
+          $summary = @"
+          # 🖥️ Remote Desktop Connection Details
+          
+          この仮想マシンは、指定された時間だけ保持されます。
 
-    - name: Setup Desktop Environment (XFCE + VNC, warnings suppressed)
-      run: |
-        sudo apt-get install -y xfce4 xfce4-goodies xorg
-        export DISPLAY=:99
-        Xvfb :99 -screen 0 1024x768x24 > xvfb.log 2>&1 &
-        sleep 3
-        mkdir -p ~/.vnc
-        echo "password" | x11vnc -storepasswd - -usepw > /dev/null
-        nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
-        sleep 5
-        export DISPLAY=:99
-        xsetroot -solid lightblue
-        startxfce4 > xfce.log 2>/dev/null &  # 警告抑制
-        sleep 10
-        echo "Desktop ready. VNC: localhost:5900 (password: password)."
+          ## 📡 RustDesk (推奨)
+          これがWeb経由で接続するための主要な方法です。
 
-    - name: Test Connection and Output Access Info
-      run: |
-        netstat -tuln | grep 211
-        netstat -tuln | grep 5900
-        if command -v rustdesk &> /dev/null; then
-          export DISPLAY=:99
-          rustdesk --get-id || true
-        fi
-        RUNNER_IP=$(curl -s ifconfig.me)
-        echo "=== ACCESS INFO (Copy this for Web Client) ==="
-        echo "Runner IP: $RUNNER_IP (ports auto-exposed)"
-        echo "RustDesk Key: $RUSTDESK_KEY"
-        echo "RustDesk ID: ${RUSTDESK_ID:-'Check rustdesk_id.log or hbbs.log'}"
-        echo "Web Client Config:"
-        echo "  ID Server: $RUNNER_IP:21116"
-        echo "  Key: $RUSTDESK_KEY"
-        echo "  Relay: $RUNNER_IP:21117"
-        echo "  WebSocket hbbs: wss://$RUNNER_IP:21118"
-        echo "  WebSocket hbbr: wss://$RUNNER_IP:21119"
-        echo "VNC Direct: vncviewer $RUNNER_IP:5900 (password: password)"
-        echo "Build Web Client: https://github.com/rustdesk/rustdesk/tree/master/web"
-        echo "  Edit config.js: idServer = '$RUNNER_IP:21116'; key = '$RUSTDESK_KEY';"
-        echo "HTTPS Proxy (Optional, local Nginx): Use sample conf below."
-        echo "============================================"
+          - **RustDesk ID:** `${{ env.rustdesk_id }}`
+          - **Password:** `${{ github.event.inputs.rustdesk_password }}`
+          
+          **接続手順:**
+          1. お使いのPCに [RustDeskクライアント](https://rustdesk.com/) をインストールします。
+          2. RustDeskを起動し、上記の「RustDesk ID」を入力して接続します。
+          3. パスワードの入力が求められたら、上記の「Password」を入力します。
 
-    - name: Persistent Demo Mode (Keep Running Indefinitely)
-      # 無限ループでジョブ継続（手動キャンセルで停止）
-      run: |
-        echo "Demo mode active. Services running... Monitor logs for stability."
-        echo "Cancel this job manually when done."
-        tail -f hbbs.log hbbr.log vnc.log xfce.log rustdesk_id.log &  # ログ監視（hbbr追加）
-        sleep infinity  # ジョブを無限継続
-      timeout-minutes: 0  # このステップ無制限
+          ---
 
-    - name: Cleanup (only if not cancelled)
-      if: always() && !cancelled()
-      run: |
-        echo "Stopping services..."
-        sudo pkill -f hbbs || true
-        sudo pkill -f hbbr || true
-        sudo pkill -f x11vnc || true
-        sudo pkill -f Xvfb || true
-        sudo pkill -f rustdesk || true
-        sudo pkill -f startxfce4 || true
-        sudo pkill -f xfce4 || true
-        sudo pkill -f socat || true
-        sleep 2
-        echo "Cleanup completed."
+          ## 🖥️ RDP (参考情報)
+          **注意:** GitHub ActionsのRunnerは一般的に外部からの直接RDP接続を許可していません。この情報は、同じ仮想ネットワーク内からアクセスする場合などに限られます。通常はRustDeskをご利用ください。
+
+          - **Computer Name (Host):** `localhost` (Runner内でのみ有効)
+          - **Username:** `runner`
+          - **Password:** `${{ github.event.inputs.rustdesk_password }}`
+          "@
+          
+          # サマリーに出力
+          echo $summary >> $env:GITHUB_STEP_SUMMARY
+
+      - name: '5: 指定時間、ジョブを保持'
+        shell: powershell
+        run: |
+          $holdMinutes = [int]"${{ github.event.inputs.hold_time_minutes }}"
+          $holdSeconds = $holdMinutes * 60
+          Write-Host "Holding the desktop session for $holdMinutes minutes ($holdSeconds seconds)."
+          Write-Host "The workflow will automatically end after this time."
+          # 指定された時間だけスリープしてジョブを維持する
+          Start-Sleep -Seconds $holdSeconds
