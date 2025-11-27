@@ -1,12 +1,34 @@
 name: Setup Desktop with RustDesk (Persistent)
 
 on:
-  workflow_dispatch:  # 手動実行推奨（終了まで待機）
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
 
 jobs:
   setup:
-    runs-on: ubuntu-latest  # Ubuntu 24.04
-    timeout-minutes: 360  # 最大6時間（Actions 制限）
+    runs-on: self-hosted  # self-hosted runner を使用（常駐化）。なければ ubuntu-latest に変更
+    timeout-minutes: 0  # 無限実行（手動キャンセル）
+
+    services:
+      rustdesk-server:
+        image: rustdesk/rustdesk-server:latest  # v1.1.14 相当、ENTRYPOINT 修正済み Docker
+        ports:
+          - 21115:21115/tcp  # hbbs TCP
+          - 21116:21116/tcp  # hbbs TCP
+          - 21116:21116/udp  # hbbs UDP (Actions で自動ハンドル)
+          - 21117:21117/tcp  # hbbr
+          - 21118:21118/tcp  # hbbs WebSocket
+          - 21119:21119/tcp  # hbbr WebSocket
+        env:
+          RELAY_HOST: localhost
+        options: >-
+          --health-cmd "curl -f http://localhost:21115 || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 3
 
     steps:
     - name: Checkout repository
@@ -15,13 +37,8 @@ jobs:
     - name: Update system and install dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install -y wget curl unzip xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl socat xfce4 xfce4-goodies xorg  # XFCE + Xorg
-        # RustDesk サーバー OSS v1.1.14 deb インストール (hbbs/hbbr を展開)
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/1.1.14/rustdesk-server-hbbs_1.1.14_amd64.deb
-        sudo dpkg -i rustdesk-server-hbbs_1.1.14_amd64.deb || sudo apt-get install -f -y
-        wget https://github.com/rustdesk/rustdesk-server/releases/download/1.1.14/rustdesk-server-hbbr_1.1.14_amd64.deb
-        sudo dpkg -i rustdesk-server-hbbr_1.1.14_amd64.deb || sudo apt-get install -f -y
-        echo "Server installed (hbbs/hbbr in /usr/bin/)."
+        sudo apt-get install -y wget curl xvfb x11vnc dbus-x11 x11-utils tigervnc-standalone-server tigervnc-common openssl dbus-x11 xfce4 xfce4-goodies xorg
+        echo "Dependencies installed."
 
     - name: Generate RustDesk key pair (Ed25519)
       run: |
@@ -31,95 +48,84 @@ jobs:
         sudo cp id_ed* /opt/rustdesk/
         RUSTDESK_KEY=$(cat id_ed25519.pub | tr -d '\n')
         echo "RUSTDESK_KEY=$RUSTDESK_KEY" >> $GITHUB_ENV
+        # Docker ボリュームにキー注入 (services で自動適用)
+        docker cp id_ed25519.pub $(docker ps -q -f name=rustdesk-server):/root/
         echo "Generated Key: $RUSTDESK_KEY"
 
-    - name: Start RustDesk Server (hbbs & hbbr)
+    - name: Install RustDesk Client (v1.4.4, AppImage fallback)
       run: |
-        # hbbs 起動
-        nohup hbbs -k /opt/rustdesk/id_ed25519 -r 127.0.0.1:21117 > hbbs.log 2>&1 &
-        sleep 5
-        # hbbr 起動
-        nohup hbbr -k /opt/rustdesk/id_ed25519 > hbbr.log 2>&1 &
-        sleep 5
-        tail -n 10 hbbs.log
-        tail -n 10 hbbr.log
-        echo "Server running on 21115-21119."
+        # deb 試行
+        if wget -q "https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk-1.4.4-x86_64.deb"; then
+          sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
+        else
+          # AppImage フォールバック
+          wget -q "https://github.com/rustdesk/rustdesk/releases/download/v1.4.4/rustdesk-1.4.4-x86_64.AppImage"
+          chmod +x rustdesk-1.4.4-x86_64.AppImage
+          sudo mv rustdesk-1.4.4-x86_64.AppImage /usr/local/bin/rustdesk
+        fi
+        if command -v rustdesk &> /dev/null; then
+          rustdesk --set-id-server "rustdesk-server:21116" --set-key "$RUSTDESK_KEY" --install-service || true
+          rustdesk --get-id || true
+        fi
+        echo "Client installed."
 
-    - name: Install RustDesk Client (v1.4.4)
+    - name: Setup Desktop Environment (XFCE + VNC, warnings suppressed)
       run: |
-        wget https://github.com/rustdesk/rustdesk/releases/download/1.4.4/rustdesk-1.4.4-x86_64.deb
-        sudo dpkg -i rustdesk-1.4.4-x86_64.deb || sudo apt-get install -f -y
-        rustdesk --set-id-server "127.0.0.1:21116" --set-key "$RUSTDESK_KEY" --install-service || true
-        rustdesk --get-id || true
-
-    - name: Setup Desktop Environment (XFCE + VNC, Warnings Suppressed)
-      run: |
-        # 警告抑制 (ヘッドレス)
-        export XDG_CURRENT_DESKTOP=""
+        # 警告抑制
+        export XDG_CURRENT_DESKTOP=XFCE
         export DISPLAY=:99
-        Xvfb :99 -screen 0 1024x768x24 > xvfb.log 2>&1 &
+        dbus-launch --exit-with-session Xvfb :99 -screen 0 1024x768x24 > xvfb.log 2>&1 &
         sleep 3
-        # VNC パスワード (Secrets 優先、デフォルト password)
-        VNC_PASS="${{ secrets.VNC_PASSWORD || 'password' }}"
         mkdir -p ~/.vnc
-        echo "$VNC_PASS" | x11vnc -storepasswd - -usepw > /dev/null
-        nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 > vnc.log 2>&1 &
+        echo "password" | x11vnc -storepasswd - -usepw > /dev/null
+        nohup x11vnc -display :99 -forever -shared -rfbauth ~/.vnc/passwd -rfbport 5900 -noxdamage > vnc.log 2>&1 &  # -noxdamage で警告減
         sleep 5
-        # XFCE 初期化 (power-manager 無効化で警告抑制)
         export DISPLAY=:99
         xsetroot -solid lightblue
-        xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/enabled -s false || true
-        nohup startxfce4 --daemon > xfce.log 2>&1 &
+        dbus-launch --exit-with-session startxfce4 &  # dbus で AT-SPI 対応
         sleep 10
-        echo "Desktop ready. VNC: localhost:5900 (password: $VNC_PASS). ID: $(rustdesk --get-id || echo 'N/A')"
+        echo "Desktop ready. VNC: localhost:5900 (password: password)."
+        if command -v rustdesk &> /dev/null; then
+          echo "RustDesk ID: $(rustdesk --get-id || echo 'Check logs')"
+        fi
 
-    - name: Expose Ports with ngrok (Auto Tunnel)
-      uses: apogiatzis/ngrok-tunneling-action@v1  # TCP トンネル
-      with:
-        timeout: 359m  # ほぼ最大（終了前）
-        ports: "21115,21116,21117,21118,21119,5900"  # RustDesk + VNC
-      env:
-        NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-
-    - name: Output Access Info (Use ngrok URLs)
+    - name: Optional: Auto-port expose via serveo.net (no account)
       run: |
-        # ngrok URL 取得 (アクション出力から、ログで確認)
-        echo "=== ACCESS INFO (Keep this window open until manual cancel) ==="
-        echo "RustDesk Key: $RUSTDESK_KEY"
-        echo "ID: $(rustdesk --get-id || echo 'N/A')"
-        echo "Runner IP: $(curl -s ifconfig.me)"
-        echo "ngrok URLs (from logs): Use wss://*.ngrok.io:<port> for Web Client"
-        echo "- hbbs (ID Server): tcp://0.tcp.ngrok.io:21116"
-        echo "- hbbr (Relay): tcp://0.tcp.ngrok.io:21117"
-        echo "- WebSocket hbbs: wss://*.ngrok.io:21118"
-        echo "- WebSocket hbbr: wss://*.ngrok.io:21119"
-        echo "- VNC: vncviewer *.ngrok.io:5900 (password: $VNC_PASS)"
-        echo "Web Client Config: ID Server = 0.tcp.ngrok.io:21116, Key = $RUSTDESK_KEY"
-        echo "Build Web: https://github.com/rustdesk/rustdesk/tree/master/web"
-        echo "=== Session active (will auto-end in ~6h) ==="
+        # serveo.net で TCP ポート自動公開 (ngrok 代替、アカウント不要)
+        nohup ssh -R 80:localhost:21116 -R 5900:localhost:5900 serveo.net -o ServerAliveInterval=60 > serveo.log 2>&1 &
+        sleep 5
+        SERVE_URL=$(tail -n 1 serveo.log | grep -o 'https://[^ ]*' || echo 'N/A')
+        echo "Serveo URL (auto-exposed): $SERVE_URL"
+        echo "SERVE_URL=$SERVE_URL" >> $GITHUB_ENV
 
-    - name: Keep Alive (Persistent Loop)
+    - name: Test Connection and Output Info
       run: |
-        echo "Session kept alive... (Manual cancel recommended)"
-        while true; do
-          echo "$(date): Session active. Connect now!"
-          # ステータス確認
-          netstat -tuln | grep 211 || true
-          netstat -tuln | grep 5900 || true
-          ps aux | grep -E "(hbbs|hbbr|x11vnc|startxfce4)" | grep -v grep || true
-          sleep 60  # 1分ごとログ（Actions 制限回避）
-        done
+        netstat -tuln | grep 211 || true
+        netstat -tuln | grep 5900 || true
+        if command -v rustdesk &> /dev/null; then
+          rustdesk --get-id || true
+        fi
+        echo "RustDesk Server Key: $RUSTDESK_KEY"
+        echo "Access via Web Client:"
+        echo "- Build/Host: https://github.com/rustdesk/rustdesk/tree/master/web"
+        echo "- Config: ID Server = rustdesk-server:21116 (or runner-ip:21116), Key = $RUSTDESK_KEY"
+        echo "- WebSocket: wss://runner-ip:21118 (hbbs) / wss://runner-ip:21119 (hbbr)"
+        echo "- Auto-exposed URL: $SERVE_URL (via serveo.net)"
+        echo "Direct VNC: vncviewer runner-ip:5900 (password: password)"
+        echo "Runner IP: $(curl -s ifconfig.me || echo 'Use self-hosted public IP')"
+        echo "To keep running: This job runs indefinitely. Cancel manually in Actions tab."
 
-    - name: Cleanup (On Cancel/Timeout)
-      if: always()
+    - name: Keep Alive (infinite loop)
       run: |
-        echo "Stopping services..."
-        sudo pkill -f hbbs || true
-        sudo pkill -f hbbr || true
+        echo "Environment ready and persistent. Sleeping indefinitely..."
+        while true; do sleep 60; echo "Still alive at $(date)"; done  # 無限ループで keep
+
+    - name: Cleanup (optional, on failure)
+      if: failure()
+      run: |
         sudo pkill -f x11vnc || true
         sudo pkill -f Xvfb || true
         sudo pkill -f rustdesk || true
         sudo pkill -f startxfce4 || true
-        sudo pkill -f xfce4 || true
-        sudo pkill -f socat || true
-        echo "Cleanup done. Session ended."
+        sudo pkill -f ssh || true  # serveo
+        echo "Cleanup on failure."
